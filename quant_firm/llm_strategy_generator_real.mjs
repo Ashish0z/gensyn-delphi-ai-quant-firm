@@ -1,37 +1,60 @@
 import 'dotenv/config';
-import { GoogleGenerativeAI } from '@google/generative-ai';
 
 /**
  * REAL LLM STRATEGY GENERATOR NODE (POWERED BY GOOGLE GEMINI API)
- * Features:
- * - Real API integration via @google/generative-ai (model: gemini-2.0-flash)
- * - Automatic 429 Rate-Limit Retry with exponential backoff
- * - Dynamic JavaScript function compilation via new Function()
+ * Direct REST API Integration with multi-model fallback & GCP project header.
  */
 export class RealLLMStrategyGeneratorNode {
   constructor() {
-    this.apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
-    if (this.apiKey) {
-      this.genAI = new GoogleGenerativeAI(this.apiKey);
-      this.model = this.genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
-    }
+    this.apiKey = process.env.GEMINI_API_KEY;
+    this.projectNum = process.env.GEMINI_PROJECT_NUMBER || '576882714676';
+    this.models = ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-1.5-pro'];
   }
 
-  async callGeminiWithRetry(prompt, maxRetries = 3) {
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      try {
-        const result = await this.model.generateContent(prompt);
-        return result.response.text();
-      } catch (err) {
-        if (err.status === 429 && attempt < maxRetries) {
-          const waitTime = attempt * 5000;
-          console.log(`  ⏳ [Gemini API 429 Rate Limit] Retrying attempt ${attempt}/${maxRetries} in ${waitTime/1000}s...`);
-          await new Promise(r => setTimeout(r, waitTime));
-        } else {
-          throw err;
+  async callGeminiREST(prompt, maxRetries = 3) {
+    const headers = {
+      'Content-Type': 'application/json',
+      'x-goog-user-project': this.projectNum,
+    };
+
+    for (const modelName of this.models) {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${this.apiKey}`;
+      
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+          const response = await fetch(url, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+              contents: [{ parts: [{ text: prompt }] }],
+            }),
+          });
+
+          const data = await response.json();
+
+          if (response.status === 429 || (data.error && data.error.code === 429)) {
+            const waitTime = attempt * 3000;
+            console.log(`  ⏳ [Gemini ${modelName} 429 Quota] Retrying attempt ${attempt}/${maxRetries} in ${waitTime/1000}s...`);
+            await new Promise(r => setTimeout(r, waitTime));
+            continue;
+          }
+
+          if (data.error) {
+            console.log(`  ⚠️ Model [${modelName}] Error [${data.error.code}]: ${data.error.message.slice(0, 80)}`);
+            break; // Try next model
+          }
+
+          if (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts[0]) {
+            return data.candidates[0].content.parts[0].text;
+          }
+        } catch (err) {
+          console.log(`  ⚠️ Model [${modelName}] Attempt ${attempt} failed: ${err.message}`);
+          await new Promise(r => setTimeout(r, 2000));
         }
       }
     }
+
+    return null;
   }
 
   async generateStrategyCandidates(count = 1) {
@@ -40,7 +63,7 @@ export class RealLLMStrategyGeneratorNode {
       return [];
     }
 
-    console.log(`[Real LLM Node] 🧠 Querying Google Gemini API (gemini-2.0-flash) for ${count} dynamic strategy code candidate(s)...`);
+    console.log(`[Real LLM Node] 🧠 Querying Google Gemini API for Project [${this.projectNum}]...`);
     const strategies = [];
 
     for (let i = 0; i < count; i++) {
@@ -60,11 +83,16 @@ export class RealLLMStrategyGeneratorNode {
           Return ONLY executable JavaScript code inside \`\`\`javascript ... \`\`\` block.
         `;
 
-        const text = await this.callGeminiWithRetry(prompt);
+        const text = await this.callGeminiREST(prompt);
+
+        if (!text) {
+          console.log('  ⚠️ [Gemini API] Could not retrieve text from LLM models. Skipping candidate.');
+          continue;
+        }
 
         // Extract JS code block
         const codeMatch = text.match(/```(?:javascript|js)?([\s\S]*?)```/) || [null, text];
-        const codeBody = codeMatch[1].trim();
+        const codeBody = codeMatch[1] ? codeMatch[1].trim() : text.trim();
 
         const stratId = `Gemini_LLM_Alpha_${Date.now()}_${i+1}`;
         const compiledFn = new Function('record', 'covMatrix', codeBody);
