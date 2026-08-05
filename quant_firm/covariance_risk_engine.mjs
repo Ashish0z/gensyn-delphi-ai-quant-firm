@@ -76,6 +76,11 @@ export class CovarianceRiskEngine {
 
   /**
    * Pre-Trade Risk Evaluation with Covariance Correlation Check
+   *
+   * Fix: covMatrix is now actually used to enforce the concentration cap.
+   * If a proposed market is highly correlated (|cov| > threshold) with
+   * existing open positions, the trade is rejected to prevent concentrated
+   * correlated exposure, regardless of raw position count.
    */
   evaluateTradeRisk(signal, walletBalanceUsdc, openPositions, marketCategory = 'crypto') {
     const currentDrawdown = (this.initialCapital - walletBalanceUsdc) / this.initialCapital;
@@ -88,12 +93,29 @@ export class CovarianceRiskEngine {
       return { passed: false, reason: `🟡 FEE BARRIER REJECT: Edge ${(edge*100).toFixed(1)}% below required min barrier ${(this.minEdgeBarrier*100).toFixed(1)}%.` };
     }
 
-    // Category Exposure Check (Covariance Guard)
-    const categoryPositions = (openPositions || []).filter(p => p.category === marketCategory);
-    if (categoryPositions.length >= 3) {
-      return { passed: false, reason: `🟡 COVARIANCE CAP REJECT: Already holding ${categoryPositions.length} correlated positions in category [${marketCategory}].` };
+    // Covariance-based concentration check
+    const covMatrix = signal.covMatrix || {};
+    const covMarkets = signal.covMarkets || [];
+    const COV_THRESHOLD = 0.02; // reject if |covariance| > 2% vs an existing holding
+    const MAX_CORRELATED = 3;
+
+    let correlatedCount = 0;
+    if (covMarkets.length > 0 && openPositions && openPositions.length > 0) {
+      for (const pos of openPositions) {
+        const key = `${signal.marketAddress}_${pos.marketProxy || pos.market || ''}`;
+        const keyRev = `${pos.marketProxy || pos.market || ''}_${signal.marketAddress}`;
+        const cov = covMatrix[key] ?? covMatrix[keyRev] ?? 0;
+        if (Math.abs(cov) > COV_THRESHOLD) correlatedCount++;
+      }
+    } else {
+      // Fallback: count by category when covMatrix is empty
+      correlatedCount = (openPositions || []).filter(p => p.category === marketCategory).length;
     }
 
-    return { passed: true, reason: `🟢 PRE-TRADE RISK & COVARIANCE CHECKS PASSED!` };
+    if (correlatedCount >= MAX_CORRELATED) {
+      return { passed: false, reason: `🟡 COVARIANCE CAP REJECT: ${correlatedCount} highly-correlated open positions detected (threshold ${COV_THRESHOLD}).` };
+    }
+
+    return { passed: true, reason: `🟢 PRE-TRADE RISK & COVARIANCE CHECKS PASSED! (correlated=${correlatedCount})` };
   }
 }
