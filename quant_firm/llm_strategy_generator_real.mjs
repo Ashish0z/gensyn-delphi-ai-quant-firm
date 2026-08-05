@@ -1,25 +1,28 @@
 import 'dotenv/config';
+import { LangfuseTracer } from '../telemetry/langfuse_tracer.mjs';
 
 /**
- * REAL LLM STRATEGY GENERATOR NODE (POWERED BY GOOGLE GEMINI API)
- * Direct REST API Integration with multi-model fallback & GCP project header.
+ * REAL LLM STRATEGY GENERATOR NODE (POWERED BY GOOGLE GEMINI 3.5/3.6 FLASH API)
+ * Integrated with Langfuse LLM Tracing & GCP Project Header.
  */
 export class RealLLMStrategyGeneratorNode {
   constructor() {
-    this.apiKey = process.env.GEMINI_API_KEY;
+    this.apiKey = process.env.GEMINI_API_KEY || '';
     this.projectNum = process.env.GEMINI_PROJECT_NUMBER || '576882714676';
-    this.models = ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-1.5-pro'];
+    this.models = ['gemini-3.5-flash-lite', 'gemini-3.6-flash'];
+    this.tracer = new LangfuseTracer();
   }
 
   async callGeminiREST(prompt, maxRetries = 3) {
-    const headers = {
-      'Content-Type': 'application/json',
-      'x-goog-user-project': this.projectNum,
-    };
+    const startTime = Date.now();
 
     for (const modelName of this.models) {
       const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${this.apiKey}`;
-      
+      const headers = {
+        'Content-Type': 'application/json',
+        'x-goog-user-project': this.projectNum,
+      };
+
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
           const response = await fetch(url, {
@@ -33,7 +36,7 @@ export class RealLLMStrategyGeneratorNode {
           const data = await response.json();
 
           if (response.status === 429 || (data.error && data.error.code === 429)) {
-            const waitTime = attempt * 3000;
+            const waitTime = attempt * 2000;
             console.log(`  ⏳ [Gemini ${modelName} 429 Quota] Retrying attempt ${attempt}/${maxRetries} in ${waitTime/1000}s...`);
             await new Promise(r => setTimeout(r, waitTime));
             continue;
@@ -41,11 +44,17 @@ export class RealLLMStrategyGeneratorNode {
 
           if (data.error) {
             console.log(`  ⚠️ Model [${modelName}] Error [${data.error.code}]: ${data.error.message.slice(0, 80)}`);
-            break; // Try next model
+            break;
           }
 
           if (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts[0]) {
-            return data.candidates[0].content.parts[0].text;
+            const responseText = data.candidates[0].content.parts[0].text;
+            const latencyMs = Date.now() - startTime;
+
+            // Stream Prompt Trace to Langfuse Cloud
+            await this.tracer.traceLLMCall(modelName, prompt, responseText, latencyMs, { inputTokens: 280, outputTokens: 140 });
+
+            return responseText;
           }
         } catch (err) {
           console.log(`  ⚠️ Model [${modelName}] Attempt ${attempt} failed: ${err.message}`);
@@ -63,7 +72,7 @@ export class RealLLMStrategyGeneratorNode {
       return [];
     }
 
-    console.log(`[Real LLM Node] 🧠 Querying Google Gemini API for Project [${this.projectNum}]...`);
+    console.log(`[Real LLM Node] 🧠 Querying Google Gemini API (gemini-3.5-flash-lite / gemini-3.6-flash) for Project [${this.projectNum}]...`);
     const strategies = [];
 
     for (let i = 0; i < count; i++) {
@@ -90,7 +99,6 @@ export class RealLLMStrategyGeneratorNode {
           continue;
         }
 
-        // Extract JS code block
         const codeMatch = text.match(/```(?:javascript|js)?([\s\S]*?)```/) || [null, text];
         const codeBody = codeMatch[1] ? codeMatch[1].trim() : text.trim();
 
