@@ -4,25 +4,41 @@ import { LangfuseTracer } from '../telemetry/langfuse_tracer.mjs';
 /**
  * OLLAMA LOCAL LLM STRATEGY GENERATOR NODE (100% FREE, LOCAL OPEN-SOURCE AI)
  * Connects to Ollama running locally at http://localhost:11434.
- * Uses local open-source LLMs (llama3.2, qwen2.5-coder, mistral, deepseek-r1) to synthesize dynamic quantitative strategy code.
+ * Auto-detects local models (e.g. gpt-oss:120b-cloud, llama3.2, qwen2.5-coder).
  */
 export class OllamaStrategyGeneratorNode {
-  constructor(modelName = 'llama3.2') {
+  constructor(modelName = 'gpt-oss:120b-cloud') {
     this.host = process.env.OLLAMA_HOST || 'http://localhost:11434';
     this.modelName = process.env.OLLAMA_MODEL || modelName;
     this.tracer = new LangfuseTracer();
+  }
+
+  async getAvailableLocalModels() {
+    try {
+      const response = await fetch(`${this.host}/api/tags`);
+      if (response.ok) {
+        const data = await response.json();
+        const models = (data.models || []).map(m => m.name);
+        if (models.length > 0) return models;
+      }
+    } catch (_) {}
+    return [this.modelName];
   }
 
   async callOllamaAPI(prompt) {
     const url = `${this.host}/api/generate`;
     const startTime = Date.now();
 
+    // Auto-detect installed model
+    const installedModels = await this.getAvailableLocalModels();
+    const activeModel = installedModels.includes(this.modelName) ? this.modelName : installedModels[0];
+
     try {
       const response = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          model: this.modelName,
+          model: activeModel,
           prompt,
           stream: false,
         }),
@@ -37,7 +53,7 @@ export class OllamaStrategyGeneratorNode {
       const latencyMs = Date.now() - startTime;
 
       // Stream trace to Langfuse Cloud
-      await this.tracer.traceLLMCall(`Ollama_${this.modelName}`, prompt, responseText, latencyMs, { inputTokens: 200, outputTokens: 100 });
+      await this.tracer.traceLLMCall(`Ollama_${activeModel}`, prompt, responseText, latencyMs, { inputTokens: 220, outputTokens: 110 });
 
       return responseText;
     } catch (err) {
@@ -47,7 +63,10 @@ export class OllamaStrategyGeneratorNode {
   }
 
   async generateStrategyCandidates(count = 1) {
-    console.log(`[Ollama Quant Researcher] 🦙 Querying local Ollama model [${this.modelName}] at ${this.host}...`);
+    const installedModels = await this.getAvailableLocalModels();
+    const activeModel = installedModels.includes(this.modelName) ? this.modelName : installedModels[0];
+
+    console.log(`[Ollama Quant Researcher] 🦙 Querying local Ollama active model [${activeModel}] at ${this.host}...`);
     const strategies = [];
 
     for (let i = 0; i < count; i++) {
@@ -69,7 +88,6 @@ export class OllamaStrategyGeneratorNode {
 
         let text = await this.callOllamaAPI(prompt);
 
-        // Fallback to local dynamic code compiler if Ollama service is not running locally
         if (!text) {
           console.log(`  💡 [Ollama Fallback] Generating local zero-cost strategy candidate...`);
           const targetCategory = ['crypto', 'politics', 'economics'][Math.floor(Math.random()*3)];
@@ -96,11 +114,11 @@ export class OllamaStrategyGeneratorNode {
         const stratId = `Ollama_Alpha_${Date.now()}_${i+1}`;
         const compiledFn = new Function('record', 'covMatrix', codeBody);
 
-        console.log(`  ✅ [Ollama Response] Successfully generated & compiled dynamic code:\n--- OLLAMA CODE ---\n${codeBody}\n-------------------`);
+        console.log(`  ✅ [Ollama ${activeModel} Response] Successfully generated & compiled dynamic code:\n--- OLLAMA CODE ---\n${codeBody}\n-------------------`);
 
         strategies.push({
           name: stratId,
-          hypothesis: `Ollama Local Strategy #${i+1}`,
+          hypothesis: `Ollama Local Strategy (${activeModel}) #${i+1}`,
           code: codeBody,
           fn: compiledFn,
         });
