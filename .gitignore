@@ -1,0 +1,22 @@
+# Environment secrets
+.env
+.env.local
+.env.*
+
+# Node dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Runtime quant data & state caches
+.quant_data/
+.quant_firm_data/
+.event_bus_log.jsonl
+.rl_policy_weights.json
+.voter_pool_stats.json
+.delphi/
+
+# OS metadata
+.DS_Store
+Thumbs.db

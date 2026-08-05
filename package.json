@@ -1,0 +1,6 @@
+{
+  "dependencies": {
+    "@gensyn-ai/gensyn-delphi-sdk": "^2.1.0",
+    "@google/generative-ai": "^0.24.1"
+  }
+}
