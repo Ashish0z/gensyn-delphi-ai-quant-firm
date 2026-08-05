@@ -1,6 +1,4 @@
 import 'dotenv/config';
-import fs from 'fs';
-import path from 'path';
 import { DelphiClient } from '@gensyn-ai/gensyn-delphi-sdk';
 import { UnifiedFeatureStore } from './unified_feature_store.mjs';
 import { OllamaStrategyGeneratorNode } from './ollama_strategy_generator_node.mjs';
@@ -11,257 +9,225 @@ import { VoterPoolValidator } from './voter_pool_validator.mjs';
 import { CovarianceRiskEngine } from './covariance_risk_engine.mjs';
 import { SignalAccumulatorBuffer } from '../event_system/signal_buffer_node.mjs';
 import { RLStrategyOptimizer } from '../event_system/rl_validator_node.mjs';
+import { appendTrade, getRecentTrades } from './db.mjs';
+import { WALLET_ADDRESS } from './config.mjs';
+import { PrometheusExporter } from '../telemetry/prometheus_exporter.mjs';
 import { execSync } from 'child_process';
-
-/* ────────── Persistent Data Helpers ────────── */
-
-const TRADE_LOG_FILE = path.join(process.cwd(), '.trade_log.json');
-const NODE_OUTPUTS_FILE = path.join(process.cwd(), '.node_outputs.json');
-
-function readJsonFile(filePath, fallback) {
-  if (fs.existsSync(filePath)) {
-    try { return JSON.parse(fs.readFileSync(filePath, 'utf8')); } catch (_) {}
-  }
-  return fallback;
-}
-
-function writeJsonFile(filePath, data) {
-  try { fs.writeFileSync(filePath, JSON.stringify(data, null, 2)); } catch (_) {}
-}
-
-function appendTradeLog(entry) {
-  const log = readJsonFile(TRADE_LOG_FILE, []);
-  log.unshift(entry);
-  if (log.length > 200) log.length = 200;
-  writeJsonFile(TRADE_LOG_FILE, log);
-}
-
-function appendNodeOutput(category, entry) {
-  const outputs = readJsonFile(NODE_OUTPUTS_FILE, {
-    ewmaAnomalies: [], riskChecks: [], signalBufferEvents: [], rlPolicyUpdates: [],
-  });
-  if (!outputs[category]) outputs[category] = [];
-  outputs[category].unshift(entry);
-  if (outputs[category].length > 100) outputs[category].length = 100;
-  writeJsonFile(NODE_OUTPUTS_FILE, outputs);
-}
 
 /* ────────── Main Daemon Cycle ────────── */
 
-async function runAIQuantFirmCycle(rlOptimizer, poolValidator, activeVoterPool, onlineEwmaNode) {
+async function runAIQuantFirmCycle(rlOptimizer, poolValidator, activeVoterPool, onlineEwmaNode, promExporter) {
   console.log(`\n================================================================`);
-  console.log(`  AI QUANT FIRM DAEMON CYCLE: LLM MODEL & VOTER CONSENSUS [${new Date().toISOString()}]  `);
+  console.log(`  AI QUANT FIRM DAEMON CYCLE [${new Date().toISOString()}]`);
   console.log(`================================================================\n`);
 
   try {
     const client = new DelphiClient();
-    const walletAddress = '0xd3F62e6c71e815E37e8Aa8E91e0E7Dc297857c37';
 
     // 1. Fetch Wallet Balance & Positions
     const { balance: rawUsdc } = await client.getErc20BalanceWithDecimals();
     const walletBalanceUsdc = Number(rawUsdc) / 1e6;
-    const { positions } = await client.listPositions({ wallet: walletAddress, redeemedOrLiquidated: false });
+    const { positions } = await client.listPositions({ wallet: WALLET_ADDRESS, redeemedOrLiquidated: false });
     const openPositions = (positions || []).filter(p => BigInt(p.shares) > 0n);
 
-    console.log(`🧠 [RL Swarm Audit] Wallet Balance: ${walletBalanceUsdc.toFixed(2)} USDC | Active Positions: ${openPositions.length}`);
-    const updatedPolicy = rlOptimizer.updateWeights({ strategy: 'Active_Pool_LLM', pnl: 0.01, fee: 0.02, edge: 0.10 });
+    console.log(`🧠 [Status] Wallet: ${walletBalanceUsdc.toFixed(2)} USDC | Open positions: ${openPositions.length}`);
 
-    appendNodeOutput('rlPolicyUpdates', {
-      timestamp: new Date().toISOString(),
-      strategy: 'Active_Pool_LLM',
-      weights: updatedPolicy,
-    });
+    // Update Prometheus wallet + positions metrics from live data
+    promExporter.updateMetric('delphi_wallet_usdc_balance', walletBalanceUsdc);
+    promExporter.updateMetric('delphi_active_positions_count', openPositions.length);
 
-    // 2. Load Feature Store
+    // 2. RL weight update from real trade log
+    const updatedPolicy = rlOptimizer.updateWeightsFromTradeLog();
+
+    // 3. Load Feature Store
     const featureStore = new UnifiedFeatureStore();
     featureStore.seedMultiFeatureDataIfEmpty();
     const historicalRecords = featureStore.getHistoricalRecords();
 
-    // 3. Invoke LLM Strategy Generator Node (Ollama / Gemini)
+    // 4. Generate LLM Strategy (Ollama primary; Gemini fallback)
     let candidateStrategies = [];
-    const ollamaResearcher = new OllamaStrategyGeneratorNode('gpt-oss:120b-cloud');
+    const ollamaResearcher = new OllamaStrategyGeneratorNode();
     candidateStrategies = await ollamaResearcher.generateStrategyCandidates(1);
 
-    if (candidateStrategies.length === 0 && process.env.GEMINI_API_KEY) {
-      console.log('  💡 Querying Google Gemini API node...');
-      const geminiResearcher = new RealLLMStrategyGeneratorNode();
-      candidateStrategies = await geminiResearcher.generateStrategyCandidates(1);
+    if (candidateStrategies.length === 0) {
+      console.log('  💡 Ollama produced no candidates. Trying RealLLMStrategyGeneratorNode...');
+      const llmResearcher = new RealLLMStrategyGeneratorNode();
+      candidateStrategies = await llmResearcher.generateStrategyCandidates(1);
     }
 
-    // 4. Backtester Tournament & Voter Registration
+    promExporter.updateMetric('delphi_llm_calls_total',
+      (promExporter.metrics.delphi_llm_calls_total || 0) + candidateStrategies.length);
+
+    // 5. Backtester Tournament with real promotion criteria
     const backtester = new BacktesterEngine(0.02, 0.02, 0.005);
     for (const strat of candidateStrategies) {
       const report = backtester.runBacktest(strat.name, strat.fn, historicalRecords);
-      const sharpe = isNaN(report.sharpeRatio) ? 3.5 : report.sharpeRatio;
-      const winRate = isNaN(report.winRate) ? 60.0 : report.winRate;
 
-      console.log(`  🌟 Promoted Candidate Strategy [${strat.name}] to Active Voter Pool (Sharpe: ${sharpe.toFixed(2)}, WinRate: ${winRate.toFixed(1)}%)`);
-      activeVoterPool.push({
-        name: strat.name,
-        fn: strat.fn,
-        code: strat.code || '',
-        sharpeRatio: sharpe,
-        winRate: winRate,
-      });
-      poolValidator.registerVoter(strat.name, sharpe, winRate);
+      // Fix 5: Use actual Sharpe/WinRate, not NaN defaults
+      const sharpe  = Number.isFinite(report.sharpeRatio) ? report.sharpeRatio : 0.0;
+      const winRate = Number.isFinite(report.winRate)     ? report.winRate     : 0.0;
+
+      const isPromoted = report.totalTrades > 0 && sharpe >= 1.0 && winRate >= 50.0;
+
+      console.log(`  ${isPromoted ? '✅' : '❌'} [${strat.name}] Sharpe: ${sharpe.toFixed(2)} | WinRate: ${winRate.toFixed(1)}% | Trades: ${report.totalTrades}`);
+
+      if (isPromoted) {
+        activeVoterPool.push({
+          name:        strat.name,
+          fn:          strat.fn,
+          code:        strat.code || '',
+          sharpeRatio: sharpe,
+          winRate,
+        });
+        poolValidator.registerVoter(strat.name, sharpe, winRate);
+      }
     }
 
-    // 5. Audit & Prune Active Voter Pool
+    // 6. Sync RL weights from voter pool
+    rlOptimizer.syncWeightsFromVoterPool(activeVoterPool);
+
+    // 7. Audit & prune pool
     const { prunedPool } = poolValidator.auditAndPrunePool(activeVoterPool);
     activeVoterPool.length = 0;
     activeVoterPool.push(...prunedPool);
 
-    console.log(`\n🏆 [Active Voter Pool Status]: ${activeVoterPool.length} active voters registered in pool.`);
+    console.log(`\n🏆 [Active Voter Pool]: ${activeVoterPool.length} active voters.`);
 
-    // 6. Risk Engine & Signal Accumulator
-    const riskEngine = new CovarianceRiskEngine({ maxDailyDrawdown: 0.02, minEdgeBarrier: updatedPolicy.thresholds.minEdge });
+    // 8. Risk Engine
+    const riskEngine = new CovarianceRiskEngine({
+      maxDailyDrawdown: 0.02,
+      minEdgeBarrier:   updatedPolicy.thresholds.minEdge,
+    });
     const signalBuffer = new SignalAccumulatorBuffer(0.35, 2);
-    const { covMatrix } = riskEngine.computeCovarianceMatrix(historicalRecords);
 
-    // 7. Live Market Evaluation via Active Voter Pool Consensus
+    // Fix 6: compute actual covariance matrix from feature store
+    const { covMatrix, markets: covMarkets } = riskEngine.computeCovarianceMatrix(historicalRecords);
+
+    // 9. Live Market Evaluation
     const { markets } = await client.listMarkets({ status: 'open', limit: 10, pricesAndImpliedProbabilities: true });
     if (!markets) return;
 
     for (const market of markets) {
       const question = market.metadata?.question || market.id;
-      const probs = market.spotImpliedProbabilities || [0.5, 0.5];
-      const now = new Date().toISOString();
+      const probs    = market.spotImpliedProbabilities || [0.5, 0.5];
 
-      // Online EWMA Anomaly Check
+      // EWMA anomaly check
       const ewmaRes = onlineEwmaNode.updateMarketTick(market.id, question, probs[0]);
-
-      appendNodeOutput('ewmaAnomalies', {
-        timestamp: now,
-        market: market.id,
-        question: question.slice(0, 80),
-        zScore: ewmaRes.zScore ?? null,
-        anomalyDetected: ewmaRes.anomalyDetected ?? false,
-        emergencySignal: ewmaRes.emergencySignal ?? null,
-      });
-
       if (ewmaRes.anomalyDetected && ewmaRes.emergencySignal) {
-        console.log(`🚨 Emergency Signal triggered for "${question.slice(0, 30)}...": ${ewmaRes.emergencySignal.reason}`);
+        console.log(`🚨 EWMA Emergency Signal: "${question.slice(0, 35)}..." ${ewmaRes.emergencySignal.reason}`);
+        promExporter.updateMetric('delphi_ewma_max_zscore', Math.abs(ewmaRes.zScore || 0));
       }
 
       const record = {
         marketAddress: market.id,
         question,
-        spotProbs: probs,
+        spotProbs:     probs,
         newsSentiment: 0.75,
-        whaleFlow: 35,
-        category: market.category,
+        whaleFlow:     35,
+        category:      market.category,
       };
 
       featureStore.recordSnapshot(market.id, question, probs, 0.75, 35, market.category);
 
-      // Evaluate Market using Active Voters in Pool
       for (const voter of activeVoterPool) {
         try {
+          // Pass covMatrix to each strategy function
           const res = voter.fn(record, covMatrix);
-          if (res && res.vote && res.vote !== 'SKIP') {
-            console.log(`  🗳️ Voter [${voter.name}] Voted [${res.vote}] for "${question.slice(0, 30)}..." | Edge: ${Math.abs(res.estimatedProb - probs[0]).toFixed(3)} | Conf: ${res.confidence}`);
-            
-            const evalRes = signalBuffer.addSignal({
-              marketAddress: market.id,
-              question,
-              currentMarketProb: probs[0],
-              estimatedTrueProb: res.estimatedProb,
-              sentimentScore: res.confidence,
+          if (!res || res.vote === 'SKIP') continue;
+
+          console.log(`  🗳️  [${voter.name}] Vote=${res.vote} | Edge=${Math.abs(res.estimatedProb - probs[0]).toFixed(3)} | Conf=${res.confidence}`);
+
+          const evalRes = signalBuffer.addSignal({
+            marketAddress:     market.id,
+            question,
+            currentMarketProb: probs[0],
+            estimatedTrueProb: res.estimatedProb,
+            sentimentScore:    res.confidence,
+          });
+
+          if (!evalRes?.triggered) continue;
+
+          const kelly = riskEngine.calculateKellySize(res.estimatedProb, probs[0], walletBalanceUsdc);
+
+          // Fix 6: supply covMatrix-derived concentration data to risk gate
+          const proposedSignal = {
+            marketAddress: market.id,
+            question,
+            outcomeIdx:    evalRes.outcomeIdx,
+            outcomeLabel:  evalRes.outcomeLabel,
+            sharesNum:     kelly.sharesNum,
+            edge:          evalRes.accumulatedMass,
+            covMatrix,
+            covMarkets,
+          };
+
+          const riskCheck = riskEngine.evaluateTradeRisk(proposedSignal, walletBalanceUsdc, openPositions, market.category);
+          console.log(`  🛡️  Risk check: ${riskCheck.reason}`);
+
+          const now = new Date().toISOString();
+
+          if (riskCheck.passed) {
+            const sharesOut = BigInt(Math.round(kelly.sharesNum * 1e18));
+            const rpcStart = Date.now();
+            const { tokensIn } = await client.quoteBuy({ marketAddress: market.id, outcomeIdx: evalRes.outcomeIdx, sharesOut });
+            const rpcLatency = Date.now() - rpcStart;
+            promExporter.updateMetric('delphi_rpc_latency_ms', rpcLatency);
+
+            const maxTokensIn = (tokensIn * 102n) / 100n;
+            await client.ensureTokenApproval({ marketAddress: market.id, minimumAmount: maxTokensIn });
+            const tradeRes = await client.buyShares({ marketAddress: market.id, outcomeIdx: evalRes.outcomeIdx, sharesOut, maxTokensIn });
+
+            console.log(`🚀 [TRADE EXECUTED] TX: ${tradeRes.transactionHash}`);
+
+            appendTrade({
+              timestamp:     now,
+              market:        market.id,
+              question:      question.slice(0, 120),
+              voter:         voter.name,
+              vote:          res.vote,
+              outcome_idx:   evalRes.outcomeIdx,
+              outcome_label: evalRes.outcomeLabel,
+              shares_num:    kelly.sharesNum,
+              edge:          evalRes.accumulatedMass,
+              risk_reason:   riskCheck.reason,
+              tx_hash:       tradeRes.transactionHash,
             });
 
-            appendNodeOutput('signalBufferEvents', {
-              timestamp: now,
-              market: market.id,
-              question: question.slice(0, 80),
-              voter: voter.name,
-              vote: res.vote,
-              triggered: evalRes?.triggered ?? false,
-              accumulatedMass: evalRes?.accumulatedMass ?? 0,
-              outcomeIdx: evalRes?.outcomeIdx ?? null,
-            });
+            poolValidator.recordTrade(voter.name);
 
-            if (evalRes && evalRes.triggered) {
-              const kelly = riskEngine.calculateKellySize(res.estimatedProb, probs[0], walletBalanceUsdc);
-              const proposedSignal = {
-                marketAddress: market.id,
-                question,
-                outcomeIdx: evalRes.outcomeIdx,
-                outcomeLabel: evalRes.outcomeLabel,
-                sharesNum: kelly.sharesNum,
-                edge: evalRes.accumulatedMass,
-              };
-
-              const riskCheck = riskEngine.evaluateTradeRisk(proposedSignal, walletBalanceUsdc, openPositions, market.category);
-              console.log(`  🛡️ [Pre-Trade Risk Check] for "${question.slice(0, 30)}...": ${riskCheck.reason}`);
-
-              appendNodeOutput('riskChecks', {
-                timestamp: now,
-                market: market.id,
-                question: question.slice(0, 80),
-                passed: riskCheck.passed,
-                reason: riskCheck.reason,
-                kellyShares: kelly.sharesNum,
-                kellyFraction: kelly.kellyFraction,
-              });
-
-              if (riskCheck.passed) {
-                const sharesOut = BigInt(Math.round(kelly.sharesNum * 1e18));
-                const { tokensIn } = await client.quoteBuy({ marketAddress: market.id, outcomeIdx: evalRes.outcomeIdx, sharesOut });
-                const maxTokensIn = (tokensIn * 102n) / 100n;
-
-                await client.ensureTokenApproval({ marketAddress: market.id, minimumAmount: maxTokensIn });
-                const tradeRes = await client.buyShares({ marketAddress: market.id, outcomeIdx: evalRes.outcomeIdx, sharesOut, maxTokensIn });
-
-                console.log(`🚀 [VOTER CONSENSUS TRADE EXECUTED!] TX: ${tradeRes.transactionHash}`);
-
-                // Persist trade to log
-                appendTradeLog({
-                  timestamp: now,
-                  market: market.id,
-                  question: question.slice(0, 120),
-                  voter: voter.name,
-                  vote: res.vote,
-                  outcomeIdx: evalRes.outcomeIdx,
-                  outcomeLabel: evalRes.outcomeLabel,
-                  sharesNum: kelly.sharesNum,
-                  edge: evalRes.accumulatedMass,
-                  riskCheckReason: riskCheck.reason,
-                  txHash: tradeRes.transactionHash,
-                });
-
-                // Update voter trade stats
-                if (poolValidator.stats[voter.name]) {
-                  poolValidator.stats[voter.name].totalTrades += 1;
-                  poolValidator.saveStats();
-                }
-
-                try {
-                  const thinkMsg = `Voter Pool Consensus Trade: ${voter.name} vote ${res.vote} on ${question.slice(0, 30)}...`;
-                  execSync(`npx tsx scripts/log-event.ts THINK "${thinkMsg}"`, { cwd: '.agents/skills/delphi' });
-                  execSync(`npx tsx scripts/log-event.ts BUY "${kelly.sharesNum} ${evalRes.outcomeLabel} shares on ${question.slice(0, 30)}..."`, { cwd: '.agents/skills/delphi' });
-                } catch (_) {}
-              }
-            }
+            try {
+              execSync(`npx tsx scripts/log-event.ts THINK "Voter Pool Consensus: ${voter.name} on ${question.slice(0, 30)}..."`, { cwd: '.agents/skills/delphi' });
+              execSync(`npx tsx scripts/log-event.ts BUY "${kelly.sharesNum} ${evalRes.outcomeLabel} shares on ${question.slice(0, 30)}..."`, { cwd: '.agents/skills/delphi' });
+            } catch (_) {}
           }
         } catch (vErr) {
-          console.error(`  ⚠️ Voter Evaluation Error [${voter.name}]: ${vErr.message}`);
+          console.error(`  ⚠️ Voter error [${voter.name}]: ${vErr.message}`);
         }
       }
     }
+
+    // Update circuit breaker metric
+    const drawdown = (1000 - walletBalanceUsdc) / 1000;
+    promExporter.updateMetric('delphi_circuit_breaker_status', drawdown >= 0.02 ? 1 : 0);
+
   } catch (err) {
     console.error('[AI Quant Firm Cycle Error]:', err.message || err);
   }
 }
 
 async function startDaemon() {
-  console.log('🤖 AI QUANT FIRM DAEMON: LLM MODEL & VOTER CONSENSUS GATEWAY LIVE');
-  const rlOptimizer = new RLStrategyOptimizer();
+  console.log('🤖 AI QUANT FIRM DAEMON: OLLAMA LLM + VOTER CONSENSUS GATEWAY LIVE');
+
+  // Fix 8: Prometheus exporter initialised with zero hardcoded values
+  const promExporter = new PrometheusExporter();
+
+  const rlOptimizer  = new RLStrategyOptimizer();
   const poolValidator = new VoterPoolValidator(5, 45.0, 15);
   const onlineEwmaNode = new OnlineEwmaMlNode(0.15, 0.10, 2.5);
   const activeVoterPool = [];
 
-  await runAIQuantFirmCycle(rlOptimizer, poolValidator, activeVoterPool, onlineEwmaNode);
-  setInterval(() => runAIQuantFirmCycle(rlOptimizer, poolValidator, activeVoterPool, onlineEwmaNode), 60_000);
+  await runAIQuantFirmCycle(rlOptimizer, poolValidator, activeVoterPool, onlineEwmaNode, promExporter);
+  setInterval(() => runAIQuantFirmCycle(rlOptimizer, poolValidator, activeVoterPool, onlineEwmaNode, promExporter), 60_000);
 }
 
 startDaemon();

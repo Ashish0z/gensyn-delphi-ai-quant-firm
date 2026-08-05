@@ -1,41 +1,48 @@
 import http from 'http';
-import fs from 'fs';
-import path from 'path';
 import { DelphiClient } from '@gensyn-ai/gensyn-delphi-sdk';
+import { getRecentTrades, getAllVoterStats, getDb } from '../quant_firm/db.mjs';
+import { WALLET_ADDRESS, TELEMETRY_PORT } from '../quant_firm/config.mjs';
 
 /**
- * FULLY DYNAMIC REAL-TIME TELEMETRY DASHBOARD SERVER
- * Zero hardcoded values. All data sourced from persisted JSON files + live Delphi RPC.
+ * REAL-TIME TELEMETRY DASHBOARD SERVER
+ * All data sourced from SQLite (trade_log, voter_stats, event_log, rl_policy) + live Delphi RPC.
+ * No flat-file reads.
  */
-export function startTelemetryDashboardServer(port = 4000) {
-  function readJson(filename, fallback) {
-    const fp = path.join(process.cwd(), filename);
-    if (fs.existsSync(fp)) {
-      try { return JSON.parse(fs.readFileSync(fp, 'utf8')); } catch (_) {}
-    }
-    return fallback;
-  }
-
+export function startTelemetryDashboardServer(port = TELEMETRY_PORT) {
   const server = http.createServer(async (req, res) => {
     /* ─── API: /api/telemetry-data ─── */
     if (req.url === '/api/telemetry-data') {
-      const traces = readJson('.llm_traces.json', []);
-      const rawVoterStats = readJson('.voter_pool_stats.json', {});
-      const tradeLog = readJson('.trade_log.json', []);
-      const nodeOutputs = readJson('.node_outputs.json', { ewmaAnomalies: [], riskChecks: [], signalBufferEvents: [], rlPolicyUpdates: [] });
-      const pnlReport = readJson('.pnl_report.json', null);
+      const db = getDb();
 
-      const allVoters = Object.values(rawVoterStats);
-      const activeVoters = allVoters.filter(v => v.status === 'ACTIVE' || !v.status);
+      // LLM traces from SQLite event_log (type = LLM_TRACE)
+      const traceRows = db
+        .prepare("SELECT payload FROM event_log WHERE type = 'LLM_TRACE' ORDER BY id DESC LIMIT 50")
+        .all();
+      const traces = traceRows.map(r => { try { return JSON.parse(r.payload); } catch (_) { return null; } }).filter(Boolean);
+
+      // Voter stats from SQLite
+      const allVoters     = getAllVoterStats();
+      const activeVoters  = allVoters.filter(v => v.status === 'ACTIVE');
       const evictedVoters = allVoters.filter(v => v.status === 'EVICTED');
 
+      // Trade log from SQLite
+      const tradeLog = getRecentTrades(200);
+
+      // RL policy from SQLite
+      let rlPolicy = null;
+      try {
+        const row = db.prepare("SELECT value FROM rl_policy WHERE key = 'state'").get();
+        if (row) rlPolicy = JSON.parse(row.value);
+      } catch (_) {}
+
+      // Live wallet + positions
       let walletBalanceUsdc = 'N/A';
       let openPositionsCount = 0;
       try {
         const client = new DelphiClient();
         const { balance: rawUsdc } = await client.getErc20BalanceWithDecimals();
         walletBalanceUsdc = (Number(rawUsdc) / 1e6).toFixed(2);
-        const { positions } = await client.listPositions({ wallet: '0xd3F62e6c71e815E37e8Aa8E91e0E7Dc297857c37', redeemedOrLiquidated: false });
+        const { positions } = await client.listPositions({ wallet: WALLET_ADDRESS, redeemedOrLiquidated: false });
         openPositionsCount = (positions || []).filter(p => BigInt(p.shares) > 0n).length;
       } catch (_) {}
 
@@ -48,8 +55,7 @@ export function startTelemetryDashboardServer(port = 4000) {
         activeVoters,
         evictedVoters,
         tradeLog,
-        nodeOutputs,
-        pnlReport,
+        rlPolicy,
       }));
       return;
     }
