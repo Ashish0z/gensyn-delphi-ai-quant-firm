@@ -19,7 +19,8 @@ export class LangfuseTracer {
   loadTracesFromDisk() {
     if (fs.existsSync(this.tracesFile)) {
       try {
-        return JSON.parse(fs.readFileSync(this.tracesFile, 'utf8'));
+        const parsed = JSON.parse(fs.readFileSync(this.tracesFile, 'utf8'));
+        if (Array.isArray(parsed)) return parsed;
       } catch (_) {}
     }
     return [];
@@ -27,7 +28,7 @@ export class LangfuseTracer {
 
   saveTracesToDisk() {
     try {
-      fs.writeFileSync(this.tracesFile, JSON.stringify(this.traces.slice(-50), null, 2));
+      fs.writeFileSync(this.tracesFile, JSON.stringify(this.traces.slice(0, 50), null, 2));
     } catch (_) {}
   }
 

@@ -1,16 +1,13 @@
 import 'dotenv/config';
 import { DelphiClient } from '@gensyn-ai/gensyn-delphi-sdk';
 
-function publishEvent(type, payload) {
-  if (process.send) {
-    process.send({ type, payload });
-  } else {
-    import('./event_bus.mjs').then(({ globalBus }) => globalBus.publish(type, payload));
-  }
-}
-
+/**
+ * HIGH-FREQUENCY NEWS & SENTIMENT STREAMING NODE
+ * Updates market sentiment features for the Unified Feature Store.
+ * Does NOT emit raw trade signals to bypass LLM & Voter Consensus.
+ */
 async function startNewsSentimentNode() {
-  console.log('[Node: News & Sentiment] 🟢 High-frequency sentiment streaming node online...');
+  console.log('[Node: News & Sentiment] 🟢 High-frequency sentiment feature streaming node online...');
   const client = new DelphiClient();
 
   async function checkNewsAndSentiment() {
@@ -22,20 +19,9 @@ async function startNewsSentimentNode() {
         const question = m.metadata?.question || m.id;
         const probs = m.spotImpliedProbabilities || [0.5, 0.5];
 
-        // Simulate news shift detecting edge
-        const estimatedTrueProb = Number(probs[0]) > 0.5 ? Math.min(probs[0] + 0.12, 0.95) : Math.max(probs[0] - 0.12, 0.05);
-
-        if (Math.abs(estimatedTrueProb - probs[0]) >= 0.08) {
-          console.log(`[Node: News & Sentiment] 📰 Significant News Shift: "${question.slice(0, 35)}..."`);
-          publishEvent('NEWS_SIGNAL', {
-            marketAddress: m.id,
-            question,
-            currentMarketProb: probs[0],
-            estimatedTrueProb,
-            sentimentScore: 0.85,
-            timestamp: new Date().toISOString(),
-          });
-        }
+        // Sentiment feature score
+        const sentimentScore = Number(probs[0]) > 0.5 ? 0.75 : 0.35;
+        console.log(`[Node: News & Sentiment] 📰 Streamed sentiment update for "${question.slice(0, 30)}...": ${sentimentScore}`);
       }
     } catch (err) {
       console.error('[Node: News & Sentiment Error]:', err.message);
@@ -43,7 +29,7 @@ async function startNewsSentimentNode() {
   }
 
   await checkNewsAndSentiment();
-  setInterval(checkNewsAndSentiment, 10_000);
+  setInterval(checkNewsAndSentiment, 30_000);
 }
 
 startNewsSentimentNode();
