@@ -1,109 +1,190 @@
-# 🏛️ Deep-Dive Architecture Specification
+# System Design Document
 
-> **Gensyn Delphi Self-Evolving AI Quant Firm**
+## 1. Purpose and Scope
 
-This document details the architectural design, mathematical foundations, IPC communication protocols, and execution pipelines powering the AI Quant Firm.
+This document describes the end-to-end architecture for the Gensyn Delphi AI Quant Firm, including:
+- Internal components and responsibilities
+- External dependencies/services
+- Data flow and interaction boundaries
+- Runtime and observability topology
 
----
+## 2. High-Level Architecture
 
-## 1. Mathematical Foundations
+The system is an event-driven multi-agent trading pipeline composed of:
 
-### A. Kelly Criterion Bet Sizing
-Position sizing is dynamically calculated using the **Kelly Criterion** formula to maximize logarithmic wealth growth while capping downside risk:
+1. **Data + feature ingestion layer**
+2. **Strategy generation and evaluation layer**
+3. **Validation and risk gate layer**
+4. **Execution layer**
+5. **Telemetry and observability layer**
+6. **Persistence layer**
 
-$$f^* = \frac{p \cdot b - q}{b}$$
+Primary process modes:
+- Single-pass orchestrator (`quant_firm/ai_quant_firm_orchestrator.mjs`)
+- Continuous daemon (`quant_firm/ai_quant_firm_daemon.mjs`)
+- Distributed event orchestrator (`event_system/orchestrator.mjs`)
 
-Where:
-* $p = \text{Estimated true outcome probability from LLM strategy}$
-* $q = 1 - p = \text{Complementary probability}$
-* $b = \text{Net odds received on bet (1:1 baseline)}$
-* $f^* = \text{Optimal capital allocation fraction (capped between 1% and 8%)}$
+## 3. Components and Interactions
 
----
+### 3.1 Internal Components
 
-### B. Cross-Asset Covariance Matrix ($\mathbf{\Sigma}$)
-To prevent over-concentrating capital in highly correlated markets (e.g. multiple crypto outcome assets), the **Covariance Risk Engine** calculates the sample covariance matrix $\mathbf{\Sigma}$ across historical probability time series:
+#### Core quant_firm components
 
-$$\mathbf{\Sigma}_{ij} = \operatorname{Cov}(X_i, X_j) = \frac{1}{N - 1} \sum_{k=1}^{N} (X_{i,k} - \bar{X}_i)(X_{j,k} - \bar{X}_j)$$
+- `quant_firm/ai_quant_firm_orchestrator.mjs`
+  - Coordinates one full strategy-to-trade cycle.
+  - Pulls data, triggers strategy generation/backtest, applies risk checks, and dispatches execution.
 
-Where $X_i$ and $X_j$ are implied probability trajectories of markets $i$ and $j$. Trades in categories exceeding maximum correlation thresholds are rejected by the pre-trade risk gateway.
+- `quant_firm/ai_quant_firm_daemon.mjs`
+  - Repeats orchestration loop on interval for continuous operation.
 
----
+- `quant_firm/unified_feature_store.mjs`
+  - Writes/reads multi-source market features.
+  - Persists structured signals and state to SQLite.
 
-### C. Reinforcement Learning Policy Weight Gradient Update
-The **RL Swarm Meta-Learner Node** adjusts strategy weights $\mathbf{w} = [w_1, w_2, \dots, w_K]^T$ online based on realized reward signals $R_t$:
+- `quant_firm/llm_strategy_generator*.mjs` and `quant_firm/ollama_strategy_generator_node.mjs`
+  - Generates candidate trading logic using configured LLM provider.
 
-$$R_t = \text{PnL}_t - \text{FeeFriction}_t - \lambda \cdot \text{Drawdown}_t$$
+- `quant_firm/voter_pool_validator.mjs`
+  - Maintains active pool of candidate strategies.
+  - Filters stale/underperforming strategies.
 
-$$w_i^{(t+1)} = \frac{w_i^{(t)} \cdot \exp(\eta \cdot R_t)}{\sum_{j=1}^{K} w_j^{(t)} \cdot \exp(\eta \cdot R_t)}$$
+- `quant_firm/covariance_risk_engine.mjs`
+  - Enforces concentration, covariance, and pre-trade safety checks.
+  - Produces size/risk decision input for execution.
 
-Where $\eta = 0.05$ is the learning rate and $\lambda$ is the drawdown penalty multiplier.
+#### quant_system components
 
----
+- `quant_system/backtester_engine.mjs`
+  - Replays historical feature windows.
+  - Computes quality metrics (e.g., win-rate/sharpe-like performance indicators).
 
-## 2. Event Interaction Sequence
+- `quant_system/ml_strategy_tournament_agent.mjs`
+  - Compares candidates and emits selected strategy set.
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Streamer as Data Ingestion Streamers
-    participant FS as Unified Feature Store DB
-    participant GEM as Gemini 2.0 Flash LLM Node
-    participant BT as Backtesting Tournament
-    participant VAL as Active Pool Validator
-    participant RL as RL Swarm Meta-Learner
-    participant RISK as Covariance Risk Engine
-    participant EX as On-Chain Executor Node
-    participant L2 as Gensyn L2 Blockchain
+- `quant_system/pre_trade_risk_engine.mjs`
+  - Additional risk checks before order intent generation.
 
-    Streamer->>FS: Record Tick (Price, News, Whale Flow)
-    GEM->>GEM: Query gemini-2.0-flash API for dynamic code
-    GEM->>BT: Send compiled JS function
-    FS->>BT: Replay 670+ historical time-series ticks
-    BT->>VAL: Submit candidate (Sharpe, WinRate)
-    VAL->>VAL: Audit Pool (Evict stale/decaying agents, cap at 5)
-    RL->>RISK: Update Policy Weights w & Dynamic Min Edge Bar
-    VAL->>RISK: Pass Validated Active Voter Pool Signals
-    RISK->>RISK: Evaluate Covariance Σ & Pre-Trade Risk Gates
-    RISK->>EX: Emit EXECUTE_TRADE_SIGNAL (Kelly sized)
-    EX->>L2: Quote, Approve Tokens & Execute On-Chain Buy
-    L2-->>EX: Return TX Hash
-    EX-->>RL: Report Realized PnL & Fee Friction
-```
+#### event_system components
 
----
+- `event_system/event_bus.mjs`
+  - Internal pub/sub event transport abstraction.
+  - Uses Redis when available; can run in in-process mode.
 
-## 3. Pre-Trade Risk Gateway Enforcements
+- `event_system/news_sentiment_node.mjs`
+  - Emits event signals from news/sentiment context.
 
-Every proposed trade must clear **4 mandatory pre-trade risk gates** before reaching the executor node:
+- `event_system/adversarial_watcher_node.mjs`
+  - Emits event signals from whale/adversarial market observations.
 
-| Risk Gate | Threshold | Rationale |
-| :--- | :--- | :--- |
-| **Circuit Breaker** | `Max 2.0% Daily Drawdown` | Halts automated trading if daily loss exceeds 2% threshold |
-| **Concentration Cap** | `Max 15% Exposure / 3 Max Correlated` | Prevents over-leveraging capital in correlated market categories |
-| **Fee Friction Barrier** | `Min 6.0% Edge` | Ensures expected return exceeds round-trip fee friction (2% buy + 2% sell = 4%) |
-| **RPC Latency Guard** | `Max 800ms Latency` | Rejects trades if RPC node latency spikes to prevent front-running |
+- `event_system/consensus_node.mjs`
+  - Aggregates per-node outputs into consensus signals.
 
----
+- `event_system/rl_validator_node.mjs`
+  - Applies adaptive weighting/meta-policy updates.
 
-## 4. Message Bus Contracts
+- `event_system/signal_buffer_node.mjs`
+  - Buffers and combines aligned signals before execution.
 
-Microservices communicate asynchronously via IPC Pub/Sub events:
+- `event_system/executor_node.mjs`
+  - Converts validated signal into on-chain actions through Delphi SDK.
 
-```json
-{
-  "eventId": "evt_178596001",
-  "type": "EXECUTE_TRADE_SIGNAL",
-  "source": "signal_buffer_node",
-  "timestamp": "2026-08-06T01:50:00.000Z",
-  "payload": {
-    "marketAddress": "0x1234...5678",
-    "question": "Will Bitcoin touch 100k$ in August 2026?",
-    "outcomeIdx": 0,
-    "outcomeLabel": "YES",
-    "sharesNum": 8,
-    "kellyFraction": 0.064,
-    "accumulatedMass": 0.42
-  }
-}
-```
+### 3.2 Telemetry components
+
+- `telemetry/prometheus_exporter.mjs`
+  - Exposes metrics endpoint for scrape.
+
+- `telemetry/telemetry_dashboard_server.mjs`
+  - Local dashboard for live runtime and strategy state.
+
+- `telemetry/langfuse_tracer.mjs`
+  - Captures LLM prompt/response traces for observability.
+
+## 4. External Services and Dependencies
+
+### Required external service
+
+- **Gensyn Delphi API / chain-facing endpoints**
+  - Used for market reads and execution paths through SDK.
+
+### Optional external/internal services
+
+- **Ollama** (`http://localhost:11434`)
+  - Local model host for strategy generation.
+
+- **Redis** (`redis://localhost:6379`)
+  - Cross-process pub/sub event transport.
+
+- **Prometheus** (`http://localhost:9090`)
+  - Scrapes application metrics.
+
+- **Grafana** (`http://localhost:3000`)
+  - Dashboard visualization of Prometheus metrics.
+
+- **Langfuse Cloud/Self-host**
+  - Optional LLM tracing backend.
+
+## 5. Persistence and Data Stores
+
+- **SQLite**: `data/quant_firm.db`
+  - Feature snapshots
+  - Trade logs
+  - Voter/strategy stats
+  - RL policy and state metadata
+
+- **In-memory/event buffers**
+  - Short-lived signal aggregation and pipeline state between event nodes.
+
+## 6. End-to-End Interaction Flow
+
+1. Ingestion nodes collect market/news/whale context and write to feature store.
+2. Strategy generators produce candidate decision logic from recent features.
+3. Backtester/tournament ranks candidates and emits active strategy subset.
+4. Validator + RL node update weights and reject weak/stale candidates.
+5. Risk engine applies pre-trade safety constraints.
+6. Signal buffer consolidates qualified intents.
+7. Executor node submits approved order flow to Delphi market interfaces.
+8. Execution results feed telemetry and persistence.
+9. Prometheus/Grafana/dashboard expose runtime state and performance.
+
+## 7. Windows Runtime Topology
+
+On Windows, recommended deployment is hybrid:
+
+- Host processes:
+  - Node runtime components (`quant_firm`, `event_system`, `quant_system`, telemetry server)
+- Docker Desktop containers:
+  - Redis
+  - Prometheus
+  - Grafana
+
+Network assumptions:
+- Host services are accessed by containers via `host.docker.internal`.
+- Compose-internal calls use service DNS names (e.g., `prometheus`).
+
+## 8. Operations and Monitoring
+
+### Health/visibility endpoints
+
+- Telemetry dashboard: `http://localhost:4000`
+- Prometheus UI: `http://localhost:9090`
+- Grafana UI: `http://localhost:3000`
+
+### Core observable signals
+
+- LLM call count and latency proxies
+- Active position count and wallet balances
+- Circuit breaker status
+- Risk/latency indicators and anomaly scores
+
+## 9. Failure Modes and Degradation
+
+- If Redis is down: event bus can fall back to in-process operation.
+- If Grafana/Prometheus are down: trading pipeline can continue without dashboards.
+- If Langfuse is unavailable: local execution continues without external trace sink.
+- If LLM provider is unavailable: strategy generation paths depending on that provider degrade or pause depending on configuration.
+
+## 10. Security and Secrets Boundaries
+
+- Secrets (wallet key, Delphi key, optional cloud keys) are sourced from `.env` only.
+- `.env` and runtime DB/artifacts must not be committed.
+- Execution node should be treated as high-trust boundary due to signing and order submission.

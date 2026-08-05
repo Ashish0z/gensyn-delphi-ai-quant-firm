@@ -1,115 +1,100 @@
-# 🚀 Quick Start Guide
+# Quick Start (Windows + Docker Desktop)
 
-Getting started with the **Gensyn Delphi AI Quant Firm** in under 5 minutes.
-
-For full infrastructure setup (Redis, Prometheus/Grafana, Langfuse) see [INFRASTRUCTURE.md](./INFRASTRUCTURE.md).
-
----
+This guide is the fastest way to run the project on Windows.
 
 ## Prerequisites
 
-| Requirement | Version | Notes |
-|---|---|---|
-| **Node.js** | v18+ | v20 recommended |
-| **Ollama** | latest | Local LLM server — primary AI backend |
-| **Git** | any | |
+1. **Docker Desktop for Windows** (WSL2 backend enabled)
+2. **Node.js 18+** (20 recommended)
+3. **Git**
+4. **Ollama** (optional but recommended AI backend)
 
----
+## 1) Start infrastructure with Docker Desktop
 
-## 1. Install Ollama and pull a model
+From repository root:
 
-```bash
-# Install Ollama — https://ollama.com
-# macOS:
-brew install ollama
-
-# Linux:
-curl -fsSL https://ollama.com/install.sh | sh
-
-# Start the server
-ollama serve
-
-# Pull a model (in a new terminal)
-ollama pull llama3.2       # recommended (~2 GB, fast)
-# or: ollama pull qwen2.5-coder
+```powershell
+cd C:\path\to\gensyn-delphi-ai-quant-firm
+docker compose -f .\infra\docker-compose.yml up -d
 ```
 
----
+Verify:
 
-## 2. Configure environment
-
-```bash
-cp .env.example .env
+```powershell
+docker compose -f .\infra\docker-compose.yml ps
 ```
 
-Edit `.env` and fill in the **required** values:
+## 2) Configure environment
 
-```env
-DELPHI_API_ACCESS_KEY=your_delphi_key
-DELPHI_SIGNER_TYPE=private_key
-WALLET_PRIVATE_KEY=0x_your_private_key
-WALLET_ADDRESS=0x_your_wallet_address
-DELPHI_NETWORK=testnet
+Create `.env` from your example/source values and set required keys:
 
-OLLAMA_HOST=http://localhost:11434
-OLLAMA_MODEL=llama3.2
-```
+- `DELPHI_API_ACCESS_KEY`
+- `DELPHI_SIGNER_TYPE=private_key`
+- `WALLET_PRIVATE_KEY`
+- `WALLET_ADDRESS`
+- `DELPHI_NETWORK=testnet` (or desired)
 
-All other values (`GEMINI_API_KEY`, `REDIS_URL`, `LANGFUSE_*`) are optional — the system runs without them.
+Recommended AI settings:
 
----
+- `OLLAMA_HOST=http://localhost:11434`
+- `OLLAMA_MODEL=llama3.2`
 
-## 3. Install Node.js dependencies
+Optional infra settings:
 
-```bash
+- `REDIS_URL=redis://localhost:6379`
+- `TELEMETRY_PORT=4000`
+
+## 3) Install dependencies
+
+```powershell
 npm install
 ```
 
----
+## 4) Run the system
 
-## 4. Run the system
+Single cycle:
 
-### Single-pass orchestrator (test one full cycle)
-
-```bash
-node quant_firm/ai_quant_firm_orchestrator.mjs
+```powershell
+node .\quant_firm\ai_quant_firm_orchestrator.mjs
 ```
 
-### 24/7 daemon (runs every 60 seconds)
+Continuous daemon:
 
-```bash
-node quant_firm/ai_quant_firm_daemon.mjs
+```powershell
+node .\quant_firm\ai_quant_firm_daemon.mjs
 ```
 
-### Full distributed cluster (all microservices + telemetry UI)
+Full distributed process orchestrator:
 
-```bash
-node event_system/orchestrator.mjs
+```powershell
+node .\event_system\orchestrator.mjs
 ```
 
----
+## 5) View dashboards
 
-## 5. Observe
+- **Telemetry dashboard**: http://localhost:4000
+- **Prometheus UI**: http://localhost:9090
+- **Grafana UI**: http://localhost:3000 (login `admin/admin`)
 
-| Interface | URL | Notes |
-|---|---|---|
-| **Telemetry Web Dashboard** | http://localhost:4000 | Live voter pool, trades, RL policy |
-| **Prometheus Metrics** | http://localhost:9090/metrics | Raw metrics |
-| **Grafana** | http://localhost:3000 | Requires Grafana — see INFRASTRUCTURE.md |
+Grafana setup:
+1. Add data source: Prometheus
+2. URL: `http://prometheus:9090` if Grafana and Prometheus are both in compose network (recommended from Grafana container context)
+3. Build panels using exported metrics such as:
+   - `delphi_wallet_usdc_balance`
+   - `delphi_active_positions_count`
+   - `delphi_llm_calls_total`
+   - `delphi_circuit_breaker_status`
+   - `delphi_rpc_latency_ms`
+   - `delphi_ewma_max_zscore`
 
----
+## 6) Stop infrastructure
 
-## 6. Inspect the database
-
-All state is in `data/quant_firm.db` (SQLite):
-
-```bash
-sqlite3 data/quant_firm.db
-
-sqlite> SELECT COUNT(*) FROM market_ticks;
-sqlite> SELECT * FROM trade_log ORDER BY id DESC LIMIT 5;
-sqlite> SELECT name, sharpe_ratio, win_rate, total_trades, status FROM voter_stats;
-sqlite> SELECT value FROM rl_policy WHERE key = 'state';
-sqlite> .quit
+```powershell
+docker compose -f .\infra\docker-compose.yml down
 ```
 
+## Troubleshooting (Windows)
+
+- If ports 3000/6379/9090 are occupied, stop conflicting apps and restart compose.
+- Ensure Docker Desktop is running before `docker compose`.
+- If Ollama is not running, use fallback/non-LLM paths or start Ollama service first.
