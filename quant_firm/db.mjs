@@ -78,8 +78,7 @@ export function getRecentTrades(limit = 200) {
 }
 
 export function getTradePnlSince(isoTimestamp) {
-  // Returns sum of realized pnl for trades after the given timestamp.
-  // We don't store pnl directly at insert time; callers must update or track separately.
+  // Returns the count of trades after the given timestamp.
   return getDb()
     .prepare(`SELECT COUNT(*) AS cnt FROM trade_log WHERE timestamp >= ?`)
     .get(isoTimestamp);

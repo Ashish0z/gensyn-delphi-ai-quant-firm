@@ -53,24 +53,32 @@ export class RLStrategyOptimizer {
 
   /**
    * RL Reward Update driven by *actual* trade outcomes from the SQLite trade_log.
+   * Uses a watermark (last processed trade id) stored in rl_policy to avoid
+   * replaying the same trades on every call.
    * Returns updated policy.
    */
   updateWeightsFromTradeLog() {
     const db = getDb();
 
-    // Read the last 20 completed trades (we don't yet resolve positions on-chain in this
-    // codebase, so we use sharesNum * edge as a proxy reward signal).
-    const recentTrades = db
-      .prepare('SELECT * FROM trade_log ORDER BY id DESC LIMIT 20')
-      .all();
+    // Load watermark from policy state
+    const lastProcessedId = this.policy._lastProcessedTradeId || 0;
 
-    for (const trade of recentTrades) {
+    const newTrades = db
+      .prepare('SELECT * FROM trade_log WHERE id > ? ORDER BY id ASC LIMIT 50')
+      .all(lastProcessedId);
+
+    if (newTrades.length === 0) return this.policy;
+
+    for (const trade of newTrades) {
       const stratName = trade.voter;
       const edge = trade.edge || 0;
-      // Proxy reward: positive edge → positive reward; scale by shares as conviction weight
       const reward = edge * Math.min(1, trade.shares_num / 10);
       this._applyReward(stratName, reward);
     }
+
+    // Persist watermark
+    this.policy._lastProcessedTradeId = newTrades[newTrades.length - 1].id;
+    this._save();
 
     return this.policy;
   }

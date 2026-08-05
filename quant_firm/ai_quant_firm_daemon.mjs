@@ -206,8 +206,8 @@ async function runAIQuantFirmCycle(rlOptimizer, poolValidator, activeVoterPool, 
       }
     }
 
-    // Update circuit breaker metric
-    const drawdown = (1000 - walletBalanceUsdc) / 1000;
+    // Update circuit breaker metric using the same initialCapital as the risk engine
+    const drawdown = (riskEngine.initialCapital - walletBalanceUsdc) / riskEngine.initialCapital;
     promExporter.updateMetric('delphi_circuit_breaker_status', drawdown >= 0.02 ? 1 : 0);
 
   } catch (err) {
