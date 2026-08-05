@@ -2,6 +2,9 @@ import 'dotenv/config';
 import { DelphiClient } from '@gensyn-ai/gensyn-delphi-sdk';
 import { UnifiedFeatureStore } from './unified_feature_store.mjs';
 import { RealLLMStrategyGeneratorNode } from './llm_strategy_generator_real.mjs';
+import { LLMNewsAgentNode } from './llm_news_agent_node.mjs';
+import { LLMWhaleAgentNode } from './llm_whale_agent_node.mjs';
+import { OnlineEwmaMlNode } from './online_ewma_ml_node.mjs';
 import { BacktesterEngine } from '../quant_system/backtester_engine.mjs';
 import { VoterPoolValidator } from './voter_pool_validator.mjs';
 import { CovarianceRiskEngine } from './covariance_risk_engine.mjs';
@@ -9,7 +12,7 @@ import { SignalAccumulatorBuffer } from '../event_system/signal_buffer_node.mjs'
 import { RLStrategyOptimizer } from '../event_system/rl_validator_node.mjs';
 import { execSync } from 'child_process';
 
-async function runAIQuantFirmCycle(rlOptimizer, poolValidator, activeVoterPool) {
+async function runAIQuantFirmCycle(rlOptimizer, poolValidator, activeVoterPool, onlineEwmaNode, llmNewsAgent, llmWhaleAgent) {
   console.log(`\n================================================================`);
   console.log(`  AI QUANT FIRM DAEMON CYCLE RUNNING [${new Date().toISOString()}]  `);
   console.log(`================================================================\n`);
@@ -36,7 +39,7 @@ async function runAIQuantFirmCycle(rlOptimizer, poolValidator, activeVoterPool) 
     const llmResearcher = new RealLLMStrategyGeneratorNode();
     const candidateStrategies = await llmResearcher.generateStrategyCandidates(1);
 
-    // 4. Backtester Tournament & Promotion to Candidate List
+    // 4. Backtester Tournament & Candidate Promotion
     const backtester = new BacktesterEngine(0.02, 0.02, 0.005);
     for (const strat of candidateStrategies) {
       const report = backtester.runBacktest(strat.name, strat.fn, historicalRecords);
@@ -52,40 +55,44 @@ async function runAIQuantFirmCycle(rlOptimizer, poolValidator, activeVoterPool) 
       }
     }
 
-    // 5. Real-Time Active Pool Performance Validator & Eviction Engine
-    const { prunedPool, evictedVoters } = poolValidator.auditAndPrunePool(activeVoterPool);
+    // 5. Active Pool Pruning Pass
+    const { prunedPool } = poolValidator.auditAndPrunePool(activeVoterPool);
     activeVoterPool.length = 0;
     activeVoterPool.push(...prunedPool);
-
-    if (evictedVoters.length > 0) {
-      try {
-        const msg = `Evicted ${evictedVoters.length} stale/underperforming voter agents. Pool size: ${activeVoterPool.length}`;
-        execSync(`npx tsx scripts/log-event.ts THINK "${msg}"`, { cwd: '.agents/skills/delphi' });
-      } catch (_) {}
-    }
-
-    if (activeVoterPool.length === 0) {
-      console.log('[AI Quant Firm] Active Voter Pool is empty after pruning pass. Cycle complete.');
-      return;
-    }
-
-    console.log(`[Active Voter Pool] Operating with ${activeVoterPool.length} validated high-Sharpe LLM agents.`);
 
     // 6. Covariance Risk Engine & Signal Accumulator
     const riskEngine = new CovarianceRiskEngine({ maxDailyDrawdown: 0.02, minEdgeBarrier: updatedPolicy.thresholds.minEdge });
     const signalBuffer = new SignalAccumulatorBuffer(0.35, 2);
     const { covMatrix } = riskEngine.computeCovarianceMatrix(historicalRecords);
 
-    // 7. Live Market Execution Pass
+    // 7. Live Market Evaluation & Online EWMA Emergency Monitor Pass
     const { markets } = await client.listMarkets({ status: 'open', limit: 10, pricesAndImpliedProbabilities: true });
     if (!markets) return;
 
     for (const market of markets) {
       const question = market.metadata?.question || market.id;
       const probs = market.spotImpliedProbabilities || [0.5, 0.5];
-      const record = { marketAddress: market.id, question, spotProbs: probs, newsSentiment: 0.80, whaleFlow: 25, category: market.category };
 
-      featureStore.recordSnapshot(market.id, question, probs, 0.80, 25, market.category);
+      // A. Online EWMA ML Model & Anomaly Check
+      const ewmaRes = onlineEwmaNode.updateMarketTick(market.id, question, probs[0]);
+      if (ewmaRes.anomalyDetected && ewmaRes.emergencySignal) {
+        console.log(`🚨 Emergency Signal triggered for "${question.slice(0, 30)}...": ${ewmaRes.emergencySignal.reason}`);
+      }
+
+      // B. Gemini LLM News & Whale Reasoning Agents
+      const newsEval = await llmNewsAgent.analyzeHeadlineWithLLM("Market volatility shifts rapidly", question);
+      const whaleEval = await llmWhaleAgent.evaluateWhaleTransactionWithLLM({ amountUsdc: 25, outcomeLabel: 'YES', marketQuestion: question });
+
+      const record = {
+        marketAddress: market.id,
+        question,
+        spotProbs: probs,
+        newsSentiment: newsEval.sentimentScore,
+        whaleFlow: whaleEval.convictionScore * 50,
+        category: market.category,
+      };
+
+      featureStore.recordSnapshot(market.id, question, probs, newsEval.sentimentScore, whaleEval.convictionScore * 50, market.category);
 
       for (const voter of activeVoterPool) {
         const res = voter.fn(record, covMatrix);
@@ -124,7 +131,7 @@ async function runAIQuantFirmCycle(rlOptimizer, poolValidator, activeVoterPool) 
                 console.log(`🚀 [AI QUANT FIRM TRADE EXECUTED!] TX: ${tradeRes.transactionHash}`);
 
                 try {
-                  const thinkMsg = `AI Quant Firm: Validated Voter ${voter.name} executed. Market: ${question}`;
+                  const thinkMsg = `AI Quant Firm: Executed trade on ${question.slice(0, 30)}...`;
                   execSync(`npx tsx scripts/log-event.ts THINK "${thinkMsg}"`, { cwd: '.agents/skills/delphi' });
                   execSync(`npx tsx scripts/log-event.ts BUY "${kelly.sharesNum} ${evalRes.outcomeLabel} shares on ${question.slice(0, 30)}..."`, { cwd: '.agents/skills/delphi' });
                 } catch (_) {}
@@ -143,13 +150,16 @@ async function runAIQuantFirmCycle(rlOptimizer, poolValidator, activeVoterPool) 
 }
 
 async function startDaemon() {
-  console.log('🤖 AI QUANT FIRM DAEMON WITH VOTER POOL EVICTION ENGINE STARTED');
+  console.log('🤖 AI QUANT FIRM DAEMON WITH ONLINE EWMA ML & LLM REASONING AGENTS STARTED');
   const rlOptimizer = new RLStrategyOptimizer();
   const poolValidator = new VoterPoolValidator(5, 45.0, 15);
+  const onlineEwmaNode = new OnlineEwmaMlNode(0.15, 0.10, 2.5);
+  const llmNewsAgent = new LLMNewsAgentNode();
+  const llmWhaleAgent = new LLMWhaleAgentNode();
   const activeVoterPool = [];
 
-  await runAIQuantFirmCycle(rlOptimizer, poolValidator, activeVoterPool);
-  setInterval(() => runAIQuantFirmCycle(rlOptimizer, poolValidator, activeVoterPool), 180_000);
+  await runAIQuantFirmCycle(rlOptimizer, poolValidator, activeVoterPool, onlineEwmaNode, llmNewsAgent, llmWhaleAgent);
+  setInterval(() => runAIQuantFirmCycle(rlOptimizer, poolValidator, activeVoterPool, onlineEwmaNode, llmNewsAgent, llmWhaleAgent), 180_000);
 }
 
 startDaemon();
