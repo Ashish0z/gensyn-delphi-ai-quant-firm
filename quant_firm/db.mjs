@@ -48,14 +48,28 @@ export function getDb() {
       realized_pnl   REAL    NOT NULL DEFAULT 0.0,
       sharpe_ratio   REAL    NOT NULL DEFAULT 0.0,
       win_rate       REAL    NOT NULL DEFAULT 50.0,
-      status         TEXT    NOT NULL DEFAULT 'ACTIVE'
+      status         TEXT    NOT NULL DEFAULT 'ACTIVE',
+      code           TEXT    NOT NULL DEFAULT ''
     );
 
     CREATE TABLE IF NOT EXISTS rl_policy (
       key   TEXT PRIMARY KEY,
       value TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS strategy_failures (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      timestamp    TEXT NOT NULL,
+      code         TEXT NOT NULL,
+      sharpe       REAL NOT NULL,
+      win_rate     REAL NOT NULL,
+      total_trades INTEGER NOT NULL,
+      reason       TEXT NOT NULL
+    );
   `);
+
+  // Migrate existing DBs that predate the code column
+  try { _db.exec('ALTER TABLE voter_stats ADD COLUMN code TEXT NOT NULL DEFAULT \'\''); } catch (_) {}
 
   return _db;
 }
@@ -86,22 +100,29 @@ export function getTradePnlSince(isoTimestamp) {
 
 /* ── Voter stats helpers ── */
 
-export function upsertVoterStats(name, sharpeRatio, winRate) {
+export function upsertVoterStats(name, sharpeRatio, winRate, code = '') {
   const existing = getDb().prepare('SELECT * FROM voter_stats WHERE name = ?').get(name);
   if (!existing) {
     getDb().prepare(`
-      INSERT INTO voter_stats (name, promoted_at, sharpe_ratio, win_rate)
-      VALUES (?, ?, ?, ?)
-    `).run(name, new Date().toISOString(), sharpeRatio, winRate);
+      INSERT INTO voter_stats (name, promoted_at, sharpe_ratio, win_rate, code)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(name, new Date().toISOString(), sharpeRatio, winRate, code);
   } else {
     getDb().prepare(`
       UPDATE voter_stats
       SET cycles_active = cycles_active + 1,
           sharpe_ratio  = ?,
-          win_rate      = ?
+          win_rate      = ?,
+          code          = CASE WHEN ? != '' THEN ? ELSE code END
       WHERE name = ?
-    `).run(sharpeRatio, winRate, name);
+    `).run(sharpeRatio, winRate, code, code, name);
   }
+}
+
+export function getActiveVoters() {
+  return getDb()
+    .prepare("SELECT name, sharpe_ratio, win_rate, code FROM voter_stats WHERE status = 'ACTIVE' AND code != '' ORDER BY sharpe_ratio DESC")
+    .all();
 }
 
 export function incrementVoterTrades(name, isWin = false) {
@@ -123,4 +144,37 @@ export function getAllVoterStats() {
 
 export function setVoterStatus(name, status) {
   getDb().prepare('UPDATE voter_stats SET status = ? WHERE name = ?').run(status, name);
+}
+
+/* ── Strategy failure log helpers ── */
+
+export function logStrategyFailure({ code, sharpe, winRate, totalTrades, reason }) {
+  getDb().prepare(`
+    INSERT INTO strategy_failures (timestamp, code, sharpe, win_rate, total_trades, reason)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(new Date().toISOString(), code, sharpe, winRate, totalTrades, reason);
+}
+
+export function getRecentStrategyFailures(limit = 5) {
+  return getDb()
+    .prepare('SELECT code, sharpe, win_rate, total_trades, reason FROM strategy_failures ORDER BY id DESC LIMIT ?')
+    .all(limit);
+}
+
+/* ── Generic node-event log (EWMA / RISK_CHECK / SIGNAL_EVENT / RL_UPDATE) ── */
+
+export function logNodeEvent(type, payload) {
+  try {
+    getDb().prepare(
+      "INSERT INTO event_log (timestamp, type, payload) VALUES (?, ?, ?)"
+    ).run(new Date().toISOString(), type, JSON.stringify(payload));
+  } catch (_) {}
+}
+
+export function getRecentNodeEvents(type, limit = 30) {
+  return getDb()
+    .prepare("SELECT timestamp, payload FROM event_log WHERE type = ? ORDER BY id DESC LIMIT ?")
+    .all(type, limit)
+    .map(r => { try { return { timestamp: r.timestamp, ...JSON.parse(r.payload) }; } catch (_) { return null; } })
+    .filter(Boolean);
 }

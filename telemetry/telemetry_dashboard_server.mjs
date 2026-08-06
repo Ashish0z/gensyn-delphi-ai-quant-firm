@@ -1,6 +1,6 @@
 import http from 'http';
 import { DelphiClient } from '@gensyn-ai/gensyn-delphi-sdk';
-import { getRecentTrades, getAllVoterStats, getDb } from '../quant_firm/db.mjs';
+import { getRecentTrades, getAllVoterStats, getDb, getRecentNodeEvents } from '../quant_firm/db.mjs';
 import { WALLET_ADDRESS, TELEMETRY_PORT } from '../quant_firm/config.mjs';
 
 /**
@@ -56,6 +56,12 @@ export function startTelemetryDashboardServer(port = TELEMETRY_PORT) {
         evictedVoters,
         tradeLog,
         rlPolicy,
+        nodeOutputs: {
+          ewmaAnomalies:    getRecentNodeEvents('EWMA_TICK', 30),
+          riskChecks:       getRecentNodeEvents('RISK_CHECK', 30),
+          signalBufferEvents: getRecentNodeEvents('SIGNAL_EVENT', 30),
+          rlPolicyUpdates:  rlPolicy ? [{ timestamp: new Date().toISOString(), strategy: 'policy', weights: rlPolicy.weights }] : [],
+        },
       }));
       return;
     }
@@ -65,6 +71,13 @@ export function startTelemetryDashboardServer(port = TELEMETRY_PORT) {
     res.end(DASHBOARD_HTML);
   });
 
+  server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      console.warn(`⚠️  [Telemetry] Port ${port} already in use — dashboard server skipped`);
+    } else {
+      console.error('[Telemetry] Server error:', err.message);
+    }
+  });
   server.listen(port, () => {
     console.log(`🌐 [Real-Time Telemetry Server] Live Observability Web UI active at http://localhost:${port}`);
   });
@@ -203,8 +216,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   <div id="t-voters" class="tab-pane card">
     <div class="sub-title">✅ Active Strategies in Pool</div>
     <div class="tbl-wrap"><table>
-      <thead><tr><th>Strategy</th><th>Sharpe</th><th>Win Rate</th><th>Cycles</th><th>Trades</th><th>PnL</th><th>Promoted</th></tr></thead>
-      <tbody id="tb-active-voters"><tr><td colspan="7" class="empty-msg">No active voters</td></tr></tbody>
+      <thead><tr><th>Strategy</th><th>Sharpe</th><th>Win Rate</th><th>Cycles</th><th>Trades</th><th>PnL</th><th>Promoted</th><th>Strategy Code</th></tr></thead>
+      <tbody id="tb-active-voters"><tr><td colspan="8" class="empty-msg">No active voters</td></tr></tbody>
     </table></div>
     <div class="sub-title" style="margin-top:1.5rem">❌ Evicted / Discarded Strategies</div>
     <div class="tbl-wrap"><table>
@@ -318,14 +331,15 @@ async function refresh() {
     document.getElementById('tb-active-voters').innerHTML = av.length > 0
       ? av.map(v => '<tr>'
         +'<td><code>'+esc(v.name)+'</code></td>'
-        +'<td><strong>'+(v.sharpeRatio!=null?v.sharpeRatio.toFixed(2):'—')+'</strong></td>'
-        +'<td>'+(v.winRate!=null?v.winRate.toFixed(1)+'%':'—')+'</td>'
-        +'<td>'+(v.cyclesActive??0)+'</td>'
-        +'<td>'+(v.totalTrades??0)+'</td>'
-        +'<td>'+(v.realizedPnl!=null?v.realizedPnl.toFixed(2):'0.00')+'</td>'
-        +'<td>'+shortTime(v.promotedAt)+'</td>'
+        +'<td><strong>'+(v.sharpe_ratio!=null?v.sharpe_ratio.toFixed(2):(v.sharpeRatio!=null?v.sharpeRatio.toFixed(2):'—'))+'</strong></td>'
+        +'<td>'+(v.win_rate!=null?v.win_rate.toFixed(1)+'%':(v.winRate!=null?v.winRate.toFixed(1)+'%':'—'))+'</td>'
+        +'<td>'+(v.cycles_active??v.cyclesActive??0)+'</td>'
+        +'<td>'+(v.total_trades??v.totalTrades??0)+'</td>'
+        +'<td>'+(v.realized_pnl!=null?v.realized_pnl.toFixed(2):(v.realizedPnl!=null?v.realizedPnl.toFixed(2):'0.00'))+'</td>'
+        +'<td>'+shortTime(v.promoted_at||v.promotedAt)+'</td>'
+        +'<td>'+(v.code ? codeBlock(v.code) : '<span style="color:var(--muted)">—</span>')+'</td>'
         +'</tr>').join('')
-      : '<tr><td colspan="7" class="empty-msg">No active voters in pool — strategies are being generated…</td></tr>';
+      : '<tr><td colspan="8" class="empty-msg">No active voters in pool — strategies are being generated…</td></tr>';
 
     document.getElementById('tb-evicted-voters').innerHTML = ev.length > 0
       ? ev.map(v => '<tr>'

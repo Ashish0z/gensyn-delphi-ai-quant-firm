@@ -58,6 +58,13 @@ export class PrometheusExporter {
         res.end('Not found');
       }
     });
+    server.on('error', (err) => {
+      if (err.code === 'EADDRINUSE') {
+        console.warn(`⚠️  [Prometheus] Port ${this.port} already in use — metrics server skipped`);
+      } else {
+        console.error('[Prometheus] Server error:', err.message);
+      }
+    });
     server.listen(this.port, () => {
       console.log(`📊 [Prometheus] Metrics available at http://localhost:${this.port}/metrics`);
     });

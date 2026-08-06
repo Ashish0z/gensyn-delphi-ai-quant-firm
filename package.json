@@ -2,6 +2,11 @@
   "dependencies": {
     "@gensyn-ai/gensyn-delphi-sdk": "^2.1.0",
     "@google/generative-ai": "^0.24.1",
-    "better-sqlite3": "^13.0.3"
+    "better-sqlite3": "^13.0.3",
+    "ls": "^1.0.0",
+    "redis": "^6.2.0"
+  },
+  "allowScripts": {
+    "better-sqlite3@13.0.3": true
   }
 }

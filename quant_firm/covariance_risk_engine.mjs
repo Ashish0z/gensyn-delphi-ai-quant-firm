@@ -7,10 +7,10 @@ import 'dotenv/config';
  */
 export class CovarianceRiskEngine {
   constructor(options = {}) {
-    this.maxDailyDrawdown = options.maxDailyDrawdown || 0.02; // 2% stop-loss
-    this.maxCategoryExposurePct = options.maxCategoryExposurePct || 0.25; // 25% per category
-    this.minEdgeBarrier = options.minEdgeBarrier || 0.06; // 6% min edge
-    this.initialCapital = 1000.0;
+    this.maxDrawdownFromPeak = options.maxDrawdownFromPeak || 0.10; // 10% from peak
+    this.maxCategoryExposurePct = options.maxCategoryExposurePct || 0.25;
+    this.minEdgeBarrier = options.minEdgeBarrier || 0.06;
+    this.peakCapital = options.peakCapital || options.initialCapital || 1000.0;
   }
 
   /**
@@ -58,18 +58,15 @@ export class CovarianceRiskEngine {
     return { markets, covMatrix };
   }
 
-  /**
-   * Kelly Criterion Optimal Bet Sizing
-   */
   calculateKellySize(estimatedProb, currentProb, walletBalanceUsdc) {
     const edge = estimatedProb - currentProb;
     const p = Math.max(0.01, Math.min(0.99, estimatedProb));
     const q = 1 - p;
     const b = 1.0; // 1:1 odds ratio baseline
 
-    const kellyFraction = Math.max(0.01, Math.min(0.08, (p * b - q) / b));
+    const kellyFraction = Math.max(0.02, Math.min(0.20, (p * b - q) / b));
     const betUsdc = walletBalanceUsdc * kellyFraction;
-    const sharesNum = Math.max(2, Math.min(10, Math.round(betUsdc / 0.80)));
+    const sharesNum = Math.max(5, Math.min(25, Math.round(betUsdc / 0.80)));
 
     return { kellyFraction, betUsdc, sharesNum };
   }
@@ -83,9 +80,9 @@ export class CovarianceRiskEngine {
    * correlated exposure, regardless of raw position count.
    */
   evaluateTradeRisk(signal, walletBalanceUsdc, openPositions, marketCategory = 'crypto') {
-    const currentDrawdown = (this.initialCapital - walletBalanceUsdc) / this.initialCapital;
-    if (currentDrawdown >= this.maxDailyDrawdown) {
-      return { passed: false, reason: `🔴 CIRCUIT BREAKER: Daily Drawdown ${(currentDrawdown*100).toFixed(2)}% exceeds max 2.0%.` };
+    const drawdownFromPeak = (this.peakCapital - walletBalanceUsdc) / this.peakCapital;
+    if (drawdownFromPeak >= this.maxDrawdownFromPeak) {
+      return { passed: false, reason: `🔴 CIRCUIT BREAKER: ${(drawdownFromPeak*100).toFixed(2)}% drawdown from peak ${this.peakCapital.toFixed(2)} USDC (max ${(this.maxDrawdownFromPeak*100).toFixed(0)}%).` };
     }
 
     const edge = Math.abs(signal.edge || 0);

@@ -1,5 +1,6 @@
 import { OLLAMA_HOST, OLLAMA_MODEL, GEMINI_API_KEY, GEMINI_PROJECT_NUM } from './config.mjs';
 import { LangfuseTracer } from '../telemetry/langfuse_tracer.mjs';
+import { getRecentStrategyFailures } from './db.mjs';
 
 /**
  * LLM STRATEGY GENERATOR NODE
@@ -123,19 +124,47 @@ return { vote: 'SKIP' };
 `.trim();
   }
 
+  _buildSuccessContext(topVoters) {
+    if (!topVoters.length) return '';
+    const snippets = topVoters.slice(0, 5).map((v, i) =>
+      `Top strategy ${i + 1} (Sharpe: ${v.sharpeRatio.toFixed(2)}, WinRate: ${v.winRate.toFixed(1)}%):\n${v.code.slice(0, 500)}`);
+    return `\n\nTOP PERFORMING STRATEGIES IN POOL (use these as a base — generate improvements, variations, or complementary approaches):\n${snippets.join('\n\n')}`;
+  }
+
+  _buildDiversityContext(existingCodes) {
+    if (!existingCodes.length) return '';
+    const snippets = existingCodes.slice(0, 8).map((c, i) =>
+      `Existing strategy ${i + 1} (DO NOT replicate):\n${c.slice(0, 300)}`);
+    return `\n\nACTIVE VOTER STRATEGIES ALREADY IN POOL (generate something meaningfully different from ALL of these):\n${snippets.join('\n\n')}`;
+  }
+
+  _buildFailureContext() {
+    let failures;
+    try { failures = getRecentStrategyFailures(5); } catch (_) { return ''; }
+    // Only surface zero-trade failures — Sharpe/WinRate are no longer gates
+    const relevant = failures.filter(f => f.reason.includes('zero trades') || f.reason.includes('duplicate'));
+    if (!relevant.length) return '';
+    const lines = relevant.map((f, i) =>
+      `Failure ${i + 1}: ${f.reason}\nCode snippet:\n${f.code.slice(0, 400)}\n`);
+    return `\n\nRECENT REJECTED STRATEGIES (these never triggered a trade signal or were duplicates — make sure your strategies will actually fire on varied market conditions):\n${lines.join('\n')}`;
+  }
+
   /* ── Public API ── */
   async generateStrategyCandidates(count = 1) {
     console.log(`[LLM Strategy] Generating ${count} candidate(s) via Ollama (${OLLAMA_HOST})...`);
     const strategies = [];
+    const failureContext = this._buildFailureContext();
+    if (failureContext) console.log(`[LLM Strategy] Injecting ${getRecentStrategyFailures(5).length} recent failure(s) into prompt.`);
+    const prompt = this._prompt + failureContext;
 
     for (let i = 0; i < count; i++) {
       // 1. Try Ollama
-      let text = await this._callOllama(this._prompt);
+      let text = await this._callOllama(prompt);
 
       // 2. Try Gemini if Ollama failed and key is available
       if (!text) {
         console.log(`  [LLM Strategy] Ollama failed for candidate ${i + 1}. ${GEMINI_API_KEY ? 'Trying Gemini fallback...' : 'Using hardcoded fallback.'}`);
-        text = await this._callGemini(this._prompt);
+        text = await this._callGemini(prompt);
       }
 
       let codeBody;
@@ -164,6 +193,52 @@ return { vote: 'SKIP' };
           });
         } catch (_) {}
       }
+    }
+
+    return strategies;
+  }
+
+  /* ── Batch generation: ask LLM for N strategies in one call ── */
+  async generateBatch(count = 5, existingCodes = [], topVoters = []) {
+    console.log(`[LLM Strategy] Requesting batch of ${count} strategies in one LLM call...`);
+    const failureContext   = this._buildFailureContext();
+    const successContext   = this._buildSuccessContext(topVoters);
+    const diversityContext = this._buildDiversityContext(existingCodes);
+    const batchPrompt = this._prompt
+      + successContext
+      + failureContext
+      + diversityContext
+      + `\n\nGenerate ${count} INDEPENDENT strategies with DIFFERENT alpha logic each.\n`
+      + `Return them as ${count} numbered blocks like this:\n\n`
+      + Array.from({ length: count }, (_, i) =>
+          `STRATEGY_${i + 1}:\n\`\`\`javascript\n// strategy ${i + 1} code here\n\`\`\``
+        ).join('\n\n');
+
+    let text = await this._callOllama(batchPrompt) || await this._callGemini(batchPrompt);
+    const strategies = [];
+
+    if (text) {
+      // Parse each STRATEGY_N block
+      const matches = [...text.matchAll(/STRATEGY_\d+:\s*```(?:javascript|js)?([\s\S]*?)```/g)];
+      for (let i = 0; i < matches.length; i++) {
+        const codeBody = matches[i][1].trim();
+        try {
+          const fn = new Function('record', 'covMatrix', codeBody);
+          const name = `LLM_Batch_${Date.now()}_${i + 1}`;
+          console.log(`  ✅ [Batch ${i + 1}/${matches.length}] Compiled (${codeBody.length} chars)`);
+          strategies.push({ name, code: codeBody, fn });
+        } catch (err) {
+          console.error(`  ❌ [Batch ${i + 1}] Compile error: ${err.message}`);
+        }
+      }
+    }
+
+    // Fill any gaps with hardcoded fallbacks so we always return `count` candidates
+    for (let i = strategies.length; i < count; i++) {
+      const code = this._hardcodedFallback(i);
+      try {
+        strategies.push({ name: `LLM_Fallback_${Date.now()}_${i + 1}`, code, fn: new Function('record', 'covMatrix', code) });
+      } catch (_) {}
     }
 
     return strategies;

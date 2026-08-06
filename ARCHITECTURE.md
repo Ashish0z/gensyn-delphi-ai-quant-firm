@@ -10,6 +10,119 @@ This document describes the end-to-end architecture for the Gensyn Delphi AI Qua
 
 ## 2. High-Level Architecture
 
+```mermaid
+flowchart TD
+    subgraph EXT["External Services"]
+        DELPHI["Gensyn Delphi API\n(markets, prices, execution)"]
+        OLLAMA["Ollama\nlocalhost:11434"]
+        GEMINI["Google Gemini\n(fallback LLM)"]
+        LANGFUSE["Langfuse Cloud\n(LLM tracing)"]
+        REDIS[("Redis\nlocalhost:6379")]
+        PROM["Prometheus\nlocalhost:9090"]
+        GRAFANA["Grafana\nlocalhost:3000"]
+    end
+
+    subgraph PERSIST["Persistence"]
+        SQLITE[("SQLite\ndata/quant_firm.db\n─────────────\ntrade_log\nvoter_stats\nrl_policy\nstrategy_failures\nevent_log")]
+    end
+
+    subgraph INGEST["1 · Ingestion & Feature Layer"]
+        UFS["UnifiedFeatureStore\nunified_feature_store.mjs"]
+        NEWS["NewsSentimentNode\nnews_sentiment_node.mjs"]
+        WHALE["WhaleAgentNode\nllm_whale_agent_node.mjs"]
+    end
+
+    subgraph STRATEGY["2 · Strategy Generation"]
+        OLLAMA_GEN["OllamaStrategyGeneratorNode\nollama_strategy_generator_node.mjs"]
+        LLM_GEN["RealLLMStrategyGeneratorNode\nllm_strategy_generator_real.mjs\n(batch + incremental)"]
+        FAILS[("strategy_failures\nin SQLite\n(failure feedback loop)")]
+    end
+
+    subgraph EVAL["3 · Evaluation & Selection"]
+        BACK["BacktesterEngine\nbacktester_engine.mjs\nSharpe ≥ 1.0 · WinRate ≥ 50%"]
+        VOTER["VoterPoolValidator\nvoter_pool_validator.mjs\n(max 5, evict stale)"]
+        RL["RLStrategyOptimizer\nrl_validator_node.mjs\n(weight sync + pruning)"]
+    end
+
+    subgraph RISK["4 · Risk & Signal Gate"]
+        SIG["SignalAccumulatorBuffer\nsignal_buffer_node.mjs\n(mass ≥ 0.20, ≥ 2 signals)"]
+        COV["CovarianceRiskEngine\ncovariance_risk_engine.mjs\nKelly · circuit breaker · cov cap"]
+        EWMA["OnlineEwmaMlNode\nonline_ewma_ml_node.mjs\n(anomaly Z-score)"]
+    end
+
+    subgraph EXEC["5 · Execution"]
+        EXECUTOR["Executor / Daemon\nai_quant_firm_daemon.mjs\nbuyShares · ensureTokenApproval"]
+    end
+
+    subgraph OBS["6 · Observability"]
+        PROM_EXP["PrometheusExporter\nprometheus_exporter.mjs\n:9091/metrics"]
+        DASH["TelemetryDashboardServer\ntelemetry_dashboard_server.mjs\n:4000"]
+        TRACER["LangfuseTracer\nlangfuse_tracer.mjs"]
+        EBUS["DistributedEventBus\nevent_bus.mjs"]
+    end
+
+    %% Ingestion
+    DELPHI -->|"listMarkets · spotProbs"| UFS
+    OLLAMA -->|"news/whale prompts"| NEWS
+    OLLAMA -->|"news/whale prompts"| WHALE
+    NEWS --> UFS
+    WHALE --> UFS
+    UFS -->|historical records| BACK
+    UFS -->|live record| SIG
+
+    %% Strategy generation
+    OLLAMA -->|generate| OLLAMA_GEN
+    OLLAMA -->|generate batch| LLM_GEN
+    GEMINI -->|fallback| LLM_GEN
+    FAILS -->|"recent failure context\ninjected into prompt"| LLM_GEN
+    OLLAMA_GEN --> BACK
+    LLM_GEN --> BACK
+
+    %% Evaluation
+    BACK -->|promoted strategies| VOTER
+    VOTER -->|active pool| RL
+    RL -->|synced weights| EXECUTOR
+
+    %% Risk gate
+    VOTER -->|"fn(record, covMatrix)"| SIG
+    EWMA -->|anomaly signal| SIG
+    SIG -->|triggered batch| COV
+    COV -->|passed| EXECUTOR
+
+    %% Execution
+    EXECUTOR -->|"buyShares · quoteBuy"| DELPHI
+    EXECUTOR -->|appendTrade| SQLITE
+
+    %% Persistence
+    VOTER -->|upsertVoterStats| SQLITE
+    RL -->|policy weights| SQLITE
+    BACK -->|logStrategyFailure| FAILS
+    FAILS -.->|stored in| SQLITE
+
+    %% Event bus
+    EXECUTOR --> EBUS
+    EBUS <-->|pub/sub| REDIS
+
+    %% Observability
+    EXECUTOR --> PROM_EXP
+    PROM_EXP -->|scrape| PROM
+    PROM --> GRAFANA
+    DASH -->|reads| SQLITE
+    DASH -->|live balance/positions| DELPHI
+    LLM_GEN --> TRACER
+    OLLAMA_GEN --> TRACER
+    TRACER -->|traces| LANGFUSE
+    TRACER -->|event_log| SQLITE
+
+    %% Styles
+    classDef ext fill:#1e3a5f,stroke:#38bdf8,color:#e2e8f0
+    classDef persist fill:#1a2e1a,stroke:#10b981,color:#e2e8f0
+    classDef obs fill:#2d1b4e,stroke:#a855f7,color:#e2e8f0
+    class DELPHI,OLLAMA,GEMINI,LANGFUSE,REDIS,PROM,GRAFANA ext
+    class SQLITE,FAILS persist
+    class PROM_EXP,DASH,TRACER,EBUS obs
+```
+
 The system is an event-driven multi-agent trading pipeline composed of:
 
 1. **Data + feature ingestion layer**

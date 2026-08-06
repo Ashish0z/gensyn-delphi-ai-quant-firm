@@ -32,8 +32,8 @@ export class RLStrategyOptimizer {
       learningRate: 0.05,
       weights: {},          // keyed by strategy name; populated from voter_stats at runtime
       thresholds: {
-        minEdge: 0.08,
-        minConfidence: 0.65,
+        minEdge: 0.04,
+        minConfidence: 0.55,
       },
       performanceHistory: {
         totalEvaluated: 0,
@@ -110,9 +110,9 @@ export class RLStrategyOptimizer {
 
     // Dynamic threshold adjustment
     if (reward < 0) {
-      this.policy.thresholds.minEdge = Math.min(0.15, this.policy.thresholds.minEdge + 0.005);
+      this.policy.thresholds.minEdge = Math.min(0.10, this.policy.thresholds.minEdge + 0.003);
     } else {
-      this.policy.thresholds.minEdge = Math.max(0.06, this.policy.thresholds.minEdge - 0.002);
+      this.policy.thresholds.minEdge = Math.max(0.02, this.policy.thresholds.minEdge - 0.001);
     }
 
     this.policy.iteration += 1;
@@ -129,12 +129,28 @@ export class RLStrategyOptimizer {
    * start with a weight proportional to their backtest Sharpe ratio.
    */
   syncWeightsFromVoterPool(voterPool) {
+    // Drop weights for voters no longer in the active pool
+    const activeNames = new Set(voterPool.map(v => v.name));
+    for (const k of Object.keys(this.policy.weights)) {
+      if (!activeNames.has(k)) delete this.policy.weights[k];
+    }
+
+    // Seed weights for newly promoted voters proportional to their backtest Sharpe
     const totalSharpe = voterPool.reduce((s, v) => s + Math.max(0.1, v.sharpeRatio || 0.1), 0);
     for (const v of voterPool) {
       if (!this.policy.weights[v.name]) {
         this.policy.weights[v.name] = Math.max(0.1, v.sharpeRatio || 0.1) / totalSharpe;
       }
     }
+
+    // Re-normalise so weights always sum to 1
+    const sum = Object.values(this.policy.weights).reduce((a, b) => a + b, 0);
+    if (sum > 0) {
+      for (const k of Object.keys(this.policy.weights)) {
+        this.policy.weights[k] /= sum;
+      }
+    }
+
     this._save();
   }
 }
