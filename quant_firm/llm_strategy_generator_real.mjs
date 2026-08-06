@@ -22,14 +22,20 @@ takes (record, covMatrix) as inputs and returns:
   { vote: 'BUY_YES' | 'BUY_NO' | 'SKIP', confidence: float (0.5–0.95), estimatedProb: float (0.0–1.0) }
 
 Available fields on 'record':
-  record.spotProbs[0]   – YES implied probability (0.0–1.0)
-  record.newsSentiment  – News sentiment score    (0.0–1.0)
-  record.whaleFlow      – Institutional USDC net volume (0–100)
-  record.category       – Market category ('crypto', 'politics', 'economics', 'miscellaneous')
+  record.spotProbs[0]      – YES implied probability (0.0–1.0)
+  record.newsSentiment     – LLM-assessed sentiment toward YES resolving (0.0–1.0)
+  record.whaleFlow         – Whale conviction score from on-chain analysis (0–100)
+  record.category          – Market category ('crypto', 'politics', 'economics', 'miscellaneous')
+  record.priceTrend        – Price change over recent ticks, positive = rising (e.g. 0.05 = +5%)
+  record.volume            – Total recent USDC trading volume (buy + sell)
+  record.daysToResolution  – Calendar days until market resolves (can be fractional)
+  record.tradingFee        – Fee fraction per trade (e.g. 0.02 = 2%) — edge must exceed this
+  record.isVerifiable      – Boolean: true if resolution uses a verifiable data source
 
 Rules:
-  - Combine at least TWO of the above features in your alpha logic.
-  - Never return BUY_YES/BUY_NO when spotProbs[0] is between 0.45 and 0.55 (low-edge zone).
+  - Combine at least THREE features for richer alpha.
+  - Always account for tradingFee: only vote when your estimated edge exceeds the fee.
+  - Consider daysToResolution: short-dated markets need tighter conviction thresholds.
   - Return ONLY executable JavaScript code inside a \`\`\`javascript ... \`\`\` block.
 `;
   }
@@ -218,10 +224,25 @@ return { vote: 'SKIP' };
     const strategies = [];
 
     if (text) {
-      // Parse each STRATEGY_N block
-      const matches = [...text.matchAll(/STRATEGY_\d+:\s*```(?:javascript|js)?([\s\S]*?)```/g)];
+      // Strategy 1: labelled STRATEGY_N: blocks (ideal format)
+      let matches = [...text.matchAll(/STRATEGY_\d+:\s*```(?:javascript|js)?([\s\S]*?)```/gi)];
+
+      // Strategy 2: any numbered heading followed by a code block
+      if (!matches.length) {
+        matches = [...text.matchAll(/(?:^|\n)(?:#+\s*)?(?:strategy\s*)?\d+[.:)]\s*[^\n]*\n```(?:javascript|js)?([\s\S]*?)```/gi)];
+      }
+
+      // Strategy 3: just extract all javascript code blocks in order
+      if (!matches.length) {
+        matches = [...text.matchAll(/```(?:javascript|js)?([\s\S]*?)```/gi)];
+      }
+
+      if (!matches.length) {
+        console.warn(`  ⚠️  [Batch] LLM returned no parseable code blocks. Output snippet:\n${text.slice(0, 300)}`);
+      }
+
       for (let i = 0; i < matches.length; i++) {
-        const codeBody = matches[i][1].trim();
+        const codeBody = (matches[i][1] || matches[i][0]).trim();
         try {
           const fn = new Function('record', 'covMatrix', codeBody);
           const name = `LLM_Batch_${Date.now()}_${i + 1}`;
@@ -233,12 +254,8 @@ return { vote: 'SKIP' };
       }
     }
 
-    // Fill any gaps with hardcoded fallbacks so we always return `count` candidates
-    for (let i = strategies.length; i < count; i++) {
-      const code = this._hardcodedFallback(i);
-      try {
-        strategies.push({ name: `LLM_Fallback_${Date.now()}_${i + 1}`, code, fn: new Function('record', 'covMatrix', code) });
-      } catch (_) {}
+    if (!strategies.length) {
+      console.warn('  ⚠️  [Batch] No strategies parsed from LLM output — skipping fallback to avoid poisoning pool with hardcoded strategies.');
     }
 
     return strategies;

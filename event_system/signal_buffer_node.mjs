@@ -7,10 +7,11 @@ import 'dotenv/config';
  * Flushes a single size-optimized batch order only when cumulative conviction mass crosses threshold.
  */
 export class SignalAccumulatorBuffer {
-  constructor(massThreshold = 0.35, minAgreeingSignals = 2) {
+  constructor(massThreshold = 0.08, minVoters = 2, consensusFraction = 0.60) {
     this.massThreshold = massThreshold;
-    this.minAgreeingSignals = minAgreeingSignals;
-    this.buffers = new Map(); // marketAddress -> SignalVector[]
+    this.minVoters = minVoters;           // minimum total participants before evaluating
+    this.consensusFraction = consensusFraction; // fraction of participants that must agree
+    this.buffers = new Map();
   }
 
   /**
@@ -60,9 +61,11 @@ export class SignalAccumulatorBuffer {
     const dominantDirection = yesMass >= noMass ? 'YES' : 'NO';
     const dominantMass = Math.max(yesMass, noMass);
     const dominantCount = dominantDirection === 'YES' ? yesCount : noCount;
+    const totalVotes = yesCount + noCount;
+    const requiredAgreement = Math.ceil(totalVotes * this.consensusFraction);
 
-    // Check if accumulation threshold crossed
-    if (dominantMass >= this.massThreshold && dominantCount >= this.minAgreeingSignals) {
+    // Trigger when: enough participants, dominant mass met, required fraction agrees
+    if (dominantMass >= this.massThreshold && totalVotes >= this.minVoters && dominantCount >= requiredAgreement) {
       const sample = buffer[0];
       const outcomeIdx = dominantDirection === 'YES' ? 0 : 1;
       

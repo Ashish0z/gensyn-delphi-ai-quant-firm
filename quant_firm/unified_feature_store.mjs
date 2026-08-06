@@ -119,13 +119,15 @@ export class UnifiedFeatureStore {
       const question    = market.metadata?.question || market.id;
       const category    = market.category || 'miscellaneous';
 
-      // Estimate per-tick volatility from recent trade volume
-      let vol = 0.012; // default 1.2% per tick
+      // Estimate per-tick volatility and volume from recent trade history
+      let vol = 0.012;
+      let totalTradeVol = 0; // total USDC volume — used to calibrate whale_flow
       try {
-        const { buys, sells } = await subgraph.getMarketTrades(market.id, { first: 50 });
-        const tradeCount = (buys?.length || 0) + (sells?.length || 0);
-        // More trades = larger price moves observed; scale vol up slightly for active markets
+        const { buys = [], sells = [] } = await subgraph.getMarketTrades(market.id, { first: 50 });
+        const tradeCount = buys.length + sells.length;
         vol = Math.min(0.04, 0.008 + tradeCount * 0.0004);
+        totalTradeVol = [...buys, ...sells].reduce((s, t) =>
+          s + Number(t.tokensIn || t.tokensOut || 0) / 1e6, 0);
       } catch (_) {}
 
       // Walk backward from current price using a random walk with mean-reversion
@@ -143,9 +145,10 @@ export class UnifiedFeatureStore {
           question,
           yes_prob:       prob,
           no_prob:        1 - prob,
-          // Sentiment and whale flow vary realistically around neutral
           news_sentiment: Math.max(0, Math.min(1, 0.5 + (Math.random() - 0.5) * 0.6)),
-          whale_flow:     Math.random() > 0.85 ? Math.round(Math.random() * 80) : 0,
+          // whale_flow = 0 for inactive markets (no trades), small value otherwise
+          whale_flow:     totalTradeVol > 0 && Math.random() > 0.80
+            ? Math.round(Math.random() * Math.min(80, totalTradeVol / 5)) : 0,
           category,
         });
       }

@@ -206,4 +206,7 @@ async function startRLValidatorNode() {
   setInterval(runValidationAndOptimizationLoop, 20_000);
 }
 
-startRLValidatorNode();
+// Only auto-start when run directly, not when imported as a module
+if (process.argv[1] && process.argv[1].endsWith('rl_validator_node.mjs')) {
+  startRLValidatorNode();
+}

@@ -2,142 +2,170 @@
 
 ## 1. Purpose and Scope
 
-This document describes the end-to-end architecture for the Gensyn Delphi AI Quant Firm, including:
-- Internal components and responsibilities
-- External dependencies/services
-- Data flow and interaction boundaries
-- Runtime and observability topology
+This document describes the end-to-end architecture for the Gensyn Delphi AI Quant Firm — a real-time, event-driven multi-agent trading system for Gensyn Delphi prediction markets.
 
-## 2. High-Level Architecture
+---
+
+## 2. Physical Architecture Design
+
+Deployment topology: Node.js processes on host, infra services in Docker Desktop.
 
 ```mermaid
-flowchart TD
-    subgraph EXT["External Services"]
-        DELPHI["Gensyn Delphi API\n(markets, prices, execution)"]
+graph TB
+    subgraph HOST["Host Machine (Windows / Linux / macOS)"]
+        subgraph PROC["Node.js Process — ai_quant_firm_daemon.mjs"]
+            L1["🔄 Strategy Evolver\nevery 5 min"]
+            L2["📡 Price Monitor\nevery 10 sec"]
+            L3["📰 Feature Ingester\nevery 60 sec"]
+            SHARED["Shared State\n(activeVoterPool, signalBuffer,\nfeatureCache, lastPrices)"]
+            L1 & L2 & L3 --> SHARED
+        end
+        DB[("SQLite\ndata/quant_firm.db")]
+        PROC --> DB
+    end
+
+    subgraph DOCKER["Docker Desktop"]
+        REDIS[("Redis\n:6379")]
+        PROM["Prometheus\n:9090"]
+        GRAFANA["Grafana\n:3000"]
+        PROM --> GRAFANA
+    end
+
+    subgraph NETWORK["Network / Internet"]
+        DELPHI["Gensyn Delphi API\n+ RPC :685685"]
+        GOLDSKY["Goldsky Subgraph\n(on-chain trade history)"]
         OLLAMA["Ollama\nlocalhost:11434"]
-        GEMINI["Google Gemini\n(fallback LLM)"]
-        LANGFUSE["Langfuse Cloud\n(LLM tracing)"]
-        REDIS[("Redis\nlocalhost:6379")]
-        PROM["Prometheus\nlocalhost:9090"]
-        GRAFANA["Grafana\nlocalhost:3000"]
+        GNEWS["Google News RSS\n(real headlines)"]
+        LANGFUSE["Langfuse Cloud\n(LLM traces)"]
+        GEMINI["Google Gemini\n(LLM fallback)"]
+    end
+
+    PROC -->|pub/sub events| REDIS
+    PROC -->|metrics :9091| PROM
+    PROC -->|dashboard :4000| HOST
+    PROC -->|markets, buy, sell| DELPHI
+    PROC -->|trade history| GOLDSKY
+    L3 -->|generate strategies| OLLAMA
+    L3 -->|news headlines| GNEWS
+    L3 -->|LLM fallback| GEMINI
+    PROC -->|trace logs| LANGFUSE
+```
+
+---
+
+## 3. System Design
+
+Internal component responsibilities and data flows.
+
+```mermaid
+flowchart LR
+    subgraph LOOPS["Real-Time Loops (concurrent)"]
+        SE["Strategy Evolver\n⏱ 5 min\n─────────────\nLLM batch generation\nBacktest tournament\nPool eviction/promotion\nRL weight sync"]
+        PM["Price Monitor\n⏱ 10 sec\n─────────────\nDetects price Δ ≥ 0.5%\nRuns voter pool\nSignal accumulation\nTrade execution\nPosition EV check"]
+        FI["Feature Ingester\n⏱ 60 sec\n─────────────\nNews RSS fetch\nSubgraph trade query\nLLM sentiment analysis\nLLM whale analysis\nUpdates feature cache"]
+    end
+
+    subgraph STRAT["Strategy Layer"]
+        POOL["Voter Pool\n(20 LLM strategies\ncompetitive Sharpe gate)"]
+        BT["BacktesterEngine\n(covMatrix-aware\nreal-anchored ticks)"]
+        RL["RLStrategyOptimizer\n(per-voter weights\nfrom trade PnL)"]
+        SE --> BT --> POOL
+        RL -->|weights| POOL
+        POOL -->|sync| RL
+    end
+
+    subgraph SIG["Signal & Risk Layer"]
+        SB["SignalAccumulatorBuffer\n(mass ≥ 0.08\n60% participant consensus)"]
+        COV["CovarianceRiskEngine\n(Kelly sizing\ncovariance cap\n50% peak drawdown)"]
+        EWMA["OnlineEwmaMlNode\n(Z-score anomaly\ndetection)"]
+        PM -->|voter votes| SB
+        SB -->|triggered| COV
+        EWMA -->|anomaly| PM
+    end
+
+    subgraph EXEC["Execution Layer"]
+        BUY["buyShares\n(ensureTokenApproval\n2% slippage)"]
+        SELL["sellShares\n(EV-based exit\ntime-urgency decay)"]
+        COV -->|passed| BUY
+        PM -->|position EV < -fee| SELL
     end
 
     subgraph PERSIST["Persistence"]
-        SQLITE[("SQLite\ndata/quant_firm.db\n─────────────\ntrade_log\nvoter_stats\nrl_policy\nstrategy_failures\nevent_log")]
+        SQLITE["SQLite\ntrade_log · voter_stats\nrl_policy · market_ticks\nevent_log · strategy_failures"]
+        BUY & SELL --> SQLITE
+        POOL --> SQLITE
     end
 
-    subgraph INGEST["1 · Ingestion & Feature Layer"]
-        UFS["UnifiedFeatureStore\nunified_feature_store.mjs"]
-        NEWS["NewsSentimentNode\nnews_sentiment_node.mjs"]
-        WHALE["WhaleAgentNode\nllm_whale_agent_node.mjs"]
-    end
-
-    subgraph STRATEGY["2 · Strategy Generation"]
-        OLLAMA_GEN["OllamaStrategyGeneratorNode\nollama_strategy_generator_node.mjs"]
-        LLM_GEN["RealLLMStrategyGeneratorNode\nllm_strategy_generator_real.mjs\n(batch + incremental)"]
-        FAILS[("strategy_failures\nin SQLite\n(failure feedback loop)")]
-    end
-
-    subgraph EVAL["3 · Evaluation & Selection"]
-        BACK["BacktesterEngine\nbacktester_engine.mjs\nSharpe ≥ 1.0 · WinRate ≥ 50%"]
-        VOTER["VoterPoolValidator\nvoter_pool_validator.mjs\n(max 5, evict stale)"]
-        RL["RLStrategyOptimizer\nrl_validator_node.mjs\n(weight sync + pruning)"]
-    end
-
-    subgraph RISK["4 · Risk & Signal Gate"]
-        SIG["SignalAccumulatorBuffer\nsignal_buffer_node.mjs\n(mass ≥ 0.20, ≥ 2 signals)"]
-        COV["CovarianceRiskEngine\ncovariance_risk_engine.mjs\nKelly · circuit breaker · cov cap"]
-        EWMA["OnlineEwmaMlNode\nonline_ewma_ml_node.mjs\n(anomaly Z-score)"]
-    end
-
-    subgraph EXEC["5 · Execution"]
-        EXECUTOR["Executor / Daemon\nai_quant_firm_daemon.mjs\nbuyShares · ensureTokenApproval"]
-    end
-
-    subgraph OBS["6 · Observability"]
-        PROM_EXP["PrometheusExporter\nprometheus_exporter.mjs\n:9091/metrics"]
-        DASH["TelemetryDashboardServer\ntelemetry_dashboard_server.mjs\n:4000"]
-        TRACER["LangfuseTracer\nlangfuse_tracer.mjs"]
-        EBUS["DistributedEventBus\nevent_bus.mjs"]
-    end
-
-    %% Ingestion
-    DELPHI -->|"listMarkets · spotProbs"| UFS
-    OLLAMA -->|"news/whale prompts"| NEWS
-    OLLAMA -->|"news/whale prompts"| WHALE
-    NEWS --> UFS
-    WHALE --> UFS
-    UFS -->|historical records| BACK
-    UFS -->|live record| SIG
-
-    %% Strategy generation
-    OLLAMA -->|generate| OLLAMA_GEN
-    OLLAMA -->|generate batch| LLM_GEN
-    GEMINI -->|fallback| LLM_GEN
-    FAILS -->|"recent failure context\ninjected into prompt"| LLM_GEN
-    OLLAMA_GEN --> BACK
-    LLM_GEN --> BACK
-
-    %% Evaluation
-    BACK -->|promoted strategies| VOTER
-    VOTER -->|active pool| RL
-    RL -->|synced weights| EXECUTOR
-
-    %% Risk gate
-    VOTER -->|"fn(record, covMatrix)"| SIG
-    EWMA -->|anomaly signal| SIG
-    SIG -->|triggered batch| COV
-    COV -->|passed| EXECUTOR
-
-    %% Execution
-    EXECUTOR -->|"buyShares · quoteBuy"| DELPHI
-    EXECUTOR -->|appendTrade| SQLITE
-
-    %% Persistence
-    VOTER -->|upsertVoterStats| SQLITE
-    RL -->|policy weights| SQLITE
-    BACK -->|logStrategyFailure| FAILS
-    FAILS -.->|stored in| SQLITE
-
-    %% Event bus
-    EXECUTOR --> EBUS
-    EBUS <-->|pub/sub| REDIS
-
-    %% Observability
-    EXECUTOR --> PROM_EXP
-    PROM_EXP -->|scrape| PROM
-    PROM --> GRAFANA
-    DASH -->|reads| SQLITE
-    DASH -->|live balance/positions| DELPHI
-    LLM_GEN --> TRACER
-    OLLAMA_GEN --> TRACER
-    TRACER -->|traces| LANGFUSE
-    TRACER -->|event_log| SQLITE
-
-    %% Styles
-    classDef ext fill:#1e3a5f,stroke:#38bdf8,color:#e2e8f0
-    classDef persist fill:#1a2e1a,stroke:#10b981,color:#e2e8f0
-    classDef obs fill:#2d1b4e,stroke:#a855f7,color:#e2e8f0
-    class DELPHI,OLLAMA,GEMINI,LANGFUSE,REDIS,PROM,GRAFANA ext
-    class SQLITE,FAILS persist
-    class PROM_EXP,DASH,TRACER,EBUS obs
+    FI -->|feature cache| PM
+    SE -.->|pool update| PM
 ```
 
-The system is an event-driven multi-agent trading pipeline composed of:
+---
 
-1. **Data + feature ingestion layer**
-2. **Strategy generation and evaluation layer**
-3. **Validation and risk gate layer**
-4. **Execution layer**
-5. **Telemetry and observability layer**
-6. **Persistence layer**
+## 4. Solution Design
 
-Primary process modes:
-- Single-pass orchestrator (`quant_firm/ai_quant_firm_orchestrator.mjs`)
-- Continuous daemon (`quant_firm/ai_quant_firm_daemon.mjs`)
-- Distributed event orchestrator (`event_system/orchestrator.mjs`)
+End-to-end decision flow for a single trade signal.
 
-## 3. Components and Interactions
+```mermaid
+sequenceDiagram
+    participant PM as Price Monitor (10s)
+    participant FI as Feature Ingester (60s)
+    participant VP as Voter Pool (20 strategies)
+    participant SB as Signal Buffer
+    participant RE as Risk Engine
+    participant EX as Execution
+    participant DB as SQLite
+    participant API as Delphi API
+
+    Note over PM,API: Triggered by market price change ≥ 0.5%
+
+    API-->>PM: spotImpliedProbabilities
+    PM->>PM: compare vs lastKnownPrice
+    PM->>PM: updateMarketTick (EWMA)
+
+    FI-->>PM: newsSentiment, whaleFlow (cached)
+    Note over FI: Updated every 60s via<br/>Google News RSS + Ollama
+
+    PM->>VP: record {spotProbs, sentiment,<br/>whale, trend, volume, days, fee}
+    loop each voter (LLM strategy fn)
+        VP-->>SB: addSignal(estimatedProb, confidence)
+    end
+
+    SB->>SB: dominantMass ≥ 0.08<br/>AND 60% of voters agree?
+    SB-->>RE: triggered (outcomeIdx, accumulatedMass)
+
+    RE->>RE: Kelly size = f(estimatedProb, price, balance)
+    RE->>RE: Peak drawdown check (≤ 50%)
+    RE->>RE: Edge barrier check (≥ minEdge)
+    RE->>RE: Covariance concentration check
+
+    RE-->>EX: passed → (shares, outcomeIdx)
+
+    EX->>API: quoteBuy → tokensIn
+    EX->>API: ensureTokenApproval
+    EX->>API: buyShares → txHash
+    EX->>DB: appendTrade (entry_prob stored)
+
+    Note over PM,DB: Position monitor (every 10s)
+    PM->>VP: re-evaluate held positions
+    VP-->>PM: RL-weighted estimatedYesProb
+    PM->>PM: holdingEV × urgency(daysLeft) < -fee?
+    PM->>API: quoteSell → sellShares
+```
+
+---
+
+## 6. Component Reference
+
+The system is a real-time event-driven multi-agent trading pipeline with three concurrent loops:
+
+- **Strategy Evolver** (5 min) — LLM batch generation, competitive backtesting, pool management
+- **Price Monitor** (10 sec) — reactive voter evaluation on price changes, signal accumulation, trade execution, position EV management
+- **Feature Ingester** (60 sec) — Google News RSS fetch, subgraph whale analysis, LLM enrichment, cache refresh
+
+Primary entry point: `node quant_firm/ai_quant_firm_daemon.mjs`
+
+## 7. Components and Interactions
 
 ### 3.1 Internal Components
 
@@ -212,7 +240,7 @@ Primary process modes:
 - `telemetry/langfuse_tracer.mjs`
   - Captures LLM prompt/response traces for observability.
 
-## 4. External Services and Dependencies
+## 8. External Services and Dependencies
 
 ### Required external service
 
@@ -236,7 +264,7 @@ Primary process modes:
 - **Langfuse Cloud/Self-host**
   - Optional LLM tracing backend.
 
-## 5. Persistence and Data Stores
+## 9. Persistence and Data Stores
 
 - **SQLite**: `data/quant_firm.db`
   - Feature snapshots
@@ -247,7 +275,7 @@ Primary process modes:
 - **In-memory/event buffers**
   - Short-lived signal aggregation and pipeline state between event nodes.
 
-## 6. End-to-End Interaction Flow
+## 10. End-to-End Interaction Flow
 
 1. Ingestion nodes collect market/news/whale context and write to feature store.
 2. Strategy generators produce candidate decision logic from recent features.
@@ -259,7 +287,7 @@ Primary process modes:
 8. Execution results feed telemetry and persistence.
 9. Prometheus/Grafana/dashboard expose runtime state and performance.
 
-## 7. Windows Runtime Topology
+## 11. Windows Runtime Topology
 
 On Windows, recommended deployment is hybrid:
 
@@ -274,7 +302,7 @@ Network assumptions:
 - Host services are accessed by containers via `host.docker.internal`.
 - Compose-internal calls use service DNS names (e.g., `prometheus`).
 
-## 8. Operations and Monitoring
+## 12. Operations and Monitoring
 
 ### Health/visibility endpoints
 
@@ -289,14 +317,14 @@ Network assumptions:
 - Circuit breaker status
 - Risk/latency indicators and anomaly scores
 
-## 9. Failure Modes and Degradation
+## 13. Failure Modes and Degradation
 
 - If Redis is down: event bus can fall back to in-process operation.
 - If Grafana/Prometheus are down: trading pipeline can continue without dashboards.
 - If Langfuse is unavailable: local execution continues without external trace sink.
 - If LLM provider is unavailable: strategy generation paths depending on that provider degrade or pause depending on configuration.
 
-## 10. Security and Secrets Boundaries
+## 14. Security and Secrets Boundaries
 
 - Secrets (wallet key, Delphi key, optional cloud keys) are sourced from `.env` only.
 - `.env` and runtime DB/artifacts must not be committed.

@@ -6,26 +6,63 @@ import { OLLAMA_HOST, OLLAMA_MODEL, GEMINI_API_KEY, GEMINI_PROJECT_NUM } from '.
  * Semantically evaluates live prediction market headlines and reasons about outcome probability shifts.
  */
 export class LLMNewsAgentNode {
-  async analyzeHeadlineWithLLM(headline, marketQuestion) {
-    const prompt = `
-You are an expert Intelligence & Geopolitical News Analysis AI for a prediction market fund.
-Analyze this news headline relative to the target market question:
-- Headline: "${headline}"
-- Market Question: "${marketQuestion}"
+  // Extract salient search terms from a market question for news lookup
+  _extractKeywords(question) {
+    const stopWords = new Set(['will','the','a','an','by','of','in','at','to','for','be','is','are','was','were','end','start','reach','hit','exceed','above','below','over','under','more','less','than','and','or','not','no','do','does','did','has','have','had','this','that','with','from','into','onto','upon','when','where','what','how','which']);
+    return question
+      .replace(/[?$%]/g, '')
+      .split(/\s+/)
+      .filter(w => w.length > 2 && !stopWords.has(w.toLowerCase()))
+      .slice(0, 4)
+      .join(' ');
+  }
 
-Return ONLY valid JSON (no markdown, no explanation):
-{"sentimentScore": <float 0.0–1.0>, "impact": "HIGH_BULLISH"|"BULLISH"|"NEUTRAL"|"BEARISH"|"HIGH_BEARISH", "reasoning": "<one sentence>"}
+  // Fetch recent headlines from Google News RSS (free, no key required)
+  async _fetchHeadlines(question) {
+    try {
+      const keywords = this._extractKeywords(question);
+      if (!keywords) return [];
+      const url = `https://news.google.com/rss/search?q=${encodeURIComponent(keywords)}&hl=en-US&gl=US&ceid=US:en`;
+      const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
+      if (!res.ok) return [];
+      const xml = await res.text();
+      // Google News RSS uses both CDATA-wrapped and plain <title> tags
+      const cdata = [...xml.matchAll(/<title><!\[CDATA\[(.*?)\]\]><\/title>/g)].map(m => m[1]);
+      const plain = [...xml.matchAll(/<title>([^<]+)<\/title>/g)].map(m => m[1]);
+      return (cdata.length ? cdata : plain).slice(1, 7); // skip first (feed title)
+    } catch (_) {
+      return [];
+    }
+  }
+
+  async analyzeMarketContext({ question, category, impliedProb, priceTrend, buyPressure }) {
+    const headlines = await this._fetchHeadlines(question);
+    const trendDesc = priceTrend > 0.02 ? 'rising' : priceTrend < -0.02 ? 'falling' : 'stable';
+    const headlinesSection = headlines.length
+      ? `\nRecent real-world headlines:\n${headlines.map((h, i) => `  ${i + 1}. ${h}`).join('\n')}`
+      : '\n(No recent headlines found — rely on market signals only)';
+
+    const prompt = `
+You are an expert prediction market analyst. Assess the outcome probability for the following market.
+
+Market question: "${question}"
+Category: ${category || 'general'}
+Current market-implied probability (YES): ${(impliedProb * 100).toFixed(1)}%
+Recent price trend: ${trendDesc} (${priceTrend >= 0 ? '+' : ''}${(priceTrend * 100).toFixed(1)}% change)
+Recent trader buy pressure: ${(buyPressure * 100).toFixed(0)}% of volume is buying YES
+${headlinesSection}
+
+Based on the headlines above and market signals, what is your sentiment toward YES resolving?
+
+Return ONLY valid JSON (no markdown):
+{"sentimentScore": <float 0.0-1.0 where 1.0=very bullish YES>, "impact": "HIGH_BULLISH"|"BULLISH"|"NEUTRAL"|"BEARISH"|"HIGH_BEARISH", "reasoning": "<one sentence>"}
     `.trim();
 
-    // 1. Try Ollama
     const ollamaResult = await this._callOllama(prompt);
     if (ollamaResult) return ollamaResult;
-
-    // 2. Try Gemini
     const geminiResult = await this._callGemini(prompt);
     if (geminiResult) return geminiResult;
-
-    return { sentimentScore: 0.5, impact: 'NEUTRAL', reasoning: 'Fallback baseline' };
+    return { sentimentScore: buyPressure, impact: 'NEUTRAL', reasoning: 'LLM unavailable — using buy pressure as proxy' };
   }
 
   async _callOllama(prompt) {

@@ -35,6 +35,7 @@ export function getDb() {
       outcome_label TEXT    NOT NULL,
       shares_num    REAL    NOT NULL,
       edge          REAL    NOT NULL,
+      entry_prob    REAL    NOT NULL DEFAULT 0,
       risk_reason   TEXT,
       tx_hash       TEXT
     );
@@ -70,6 +71,7 @@ export function getDb() {
 
   // Migrate existing DBs that predate the code column
   try { _db.exec('ALTER TABLE voter_stats ADD COLUMN code TEXT NOT NULL DEFAULT \'\''); } catch (_) {}
+  try { _db.exec('ALTER TABLE trade_log ADD COLUMN entry_prob REAL NOT NULL DEFAULT 0'); } catch (_) {}
 
   return _db;
 }
@@ -79,10 +81,17 @@ export function getDb() {
 export function appendTrade(entry) {
   getDb().prepare(`
     INSERT INTO trade_log
-      (timestamp, market, question, voter, vote, outcome_idx, outcome_label, shares_num, edge, risk_reason, tx_hash)
+      (timestamp, market, question, voter, vote, outcome_idx, outcome_label, shares_num, edge, entry_prob, risk_reason, tx_hash)
     VALUES
-      (@timestamp, @market, @question, @voter, @vote, @outcome_idx, @outcome_label, @shares_num, @edge, @risk_reason, @tx_hash)
+      (@timestamp, @market, @question, @voter, @vote, @outcome_idx, @outcome_label, @shares_num, @edge, @entry_prob, @risk_reason, @tx_hash)
   `).run(entry);
+}
+
+export function getOpenPositionEntries(marketProxy, outcomeIdx) {
+  // Returns the most recent unclosed buy for this market+outcome to get entry price
+  return getDb()
+    .prepare('SELECT * FROM trade_log WHERE market=? AND outcome_idx=? ORDER BY id DESC LIMIT 1')
+    .get(marketProxy, outcomeIdx);
 }
 
 export function getRecentTrades(limit = 200) {

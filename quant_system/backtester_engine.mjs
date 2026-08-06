@@ -24,7 +24,12 @@ export class BacktesterEngine {
 
     for (let i = 0; i < ticks.length; i++) {
       const tick = ticks[i];
-      const res = strategyFn(tick);
+      let res;
+      try {
+        res = strategyFn(tick, {}); // pass empty covMatrix so strategies don't throw
+      } catch (_) {
+        res = null;
+      }
 
       // Check open position exits (simulate hold for 10 ticks or resolution)
       for (let j = positions.length - 1; j >= 0; j--) {
